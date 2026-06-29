@@ -1,0 +1,27 @@
+# Dependencies and build outputs
+node_modules/
+frontend/node_modules/
+frontend/dist/
+backend/target/
+
+# Logs and local runtime files
+*.log
+*.pid
+*.tmp
+tmp_*.ps1
+tmp_*.json
+
+# Local/user data
+printer/Templates/*
+!printer/Templates/.gitkeep
+
+# Reference/third-party source snapshots used during development
+data/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
