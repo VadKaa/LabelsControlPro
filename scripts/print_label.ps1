@@ -56,6 +56,27 @@ function Draw-Code128B {
     }
 }
 
+function Get-LayoutOffset {
+    param($Payload, [string]$Field)
+    $result = [ordered]@{ x = 0; y = 0; scale = 1.0 }
+    $layoutProp = $Payload.PSObject.Properties['layout_offsets']
+    if ($null -eq $layoutProp) { return $result }
+    $fieldProp = $layoutProp.Value.PSObject.Properties[$Field]
+    if ($null -eq $fieldProp) { return $result }
+    $fieldValue = $fieldProp.Value
+    if ($fieldValue.PSObject.Properties['x']) { $result.x = [int]$fieldValue.x }
+    if ($fieldValue.PSObject.Properties['y']) { $result.y = [int]$fieldValue.y }
+    if ($fieldValue.PSObject.Properties['scale']) { $result.scale = [double]$fieldValue.scale }
+    if ($result.scale -lt 0.65) { $result.scale = 0.65 }
+    if ($result.scale -gt 1.5) { $result.scale = 1.5 }
+    return ,([pscustomobject]$result)
+}
+
+function New-ScaledFont {
+    param($Font, [double]$Scale)
+    return New-Object System.Drawing.Font($Font.FontFamily, [float]($Font.Size * $Scale), $Font.Style)
+}
+
 function Send-RawToPrinter {
     param([string]$PrinterName, [string]$DocumentName, [string]$Data)
     $signature = @"
@@ -126,7 +147,7 @@ try {
     $printerProfile = if ($payload.printer_profile) { $payload.printer_profile.ToString() } else { "brother_ql_windows" }
 
     if ($printerProfile -eq "zebra_zpl") {
-        $dpi = if ($payload.zpl_dpi) { [int]$payload.zpl_dpi } else { 203 }
+        $dpi = if ($payload.PSObject.Properties['zpl_dpi'] -and $payload.zpl_dpi) { [int]$payload.zpl_dpi } else { 203 }
         if ($dpi -ne 300) { $dpi = 203 }
         $dotsPerMm = $dpi / 25.4
         $labelWidthDots = [int][Math]::Round($LabelWidthMm * $dotsPerMm)
@@ -164,8 +185,8 @@ try {
     $labelWidthHi = [int][Math]::Round(($LabelWidthMm / 25.4) * 100)
     $labelLengthHi = [int][Math]::Round(($LabelLengthMm / 25.4) * 100)
     $paperSize = $null
-    $printerProfile = if ($payload.printer_profile) { $payload.printer_profile.ToString() } else { "brother_ql_windows" }
-    $driverMediaName = if ($payload.driver_media_name) { $payload.driver_media_name.ToString() } else { "" }
+    $printerProfile = if ($payload.PSObject.Properties['printer_profile'] -and $payload.printer_profile) { $payload.printer_profile.ToString() } else { "brother_ql_windows" }
+    $driverMediaName = if ($payload.PSObject.Properties['driver_media_name'] -and $payload.driver_media_name) { $payload.driver_media_name.ToString() } else { "" }
     if ([string]::IsNullOrWhiteSpace($driverMediaName) -and $printerProfile -eq "brother_ql_windows") { $driverMediaName = "${LabelWidthMm}mm" }
 
     if ($printerProfile -eq "zebra_zpl") {
@@ -236,8 +257,13 @@ try {
         $weight = if ($payload.weight) { $payload.weight.ToString() } else { "" }
         $barcode = if ($payload.barcode) { $payload.barcode.ToString() } else { "" }
         $notes = if ($payload.notes) { $payload.notes.ToString() } else { "" }
-        $layoutPreset = if ($payload.layout_preset) { $payload.layout_preset.ToString() } else { "compact_right" }
-        $barcodeWidthPct = if ($payload.barcode_width_pct) { [int]$payload.barcode_width_pct } else { 42 }
+        $offProductNumber = Get-LayoutOffset -Payload $payload -Field "product_number"
+        $offProductName = Get-LayoutOffset -Payload $payload -Field "product_name"
+        $offBarcode = Get-LayoutOffset -Payload $payload -Field "barcode"
+        $offDetails = Get-LayoutOffset -Payload $payload -Field "details"
+        $offNotes = Get-LayoutOffset -Payload $payload -Field "notes"
+        $layoutPreset = if ($payload.PSObject.Properties['layout_preset'] -and $payload.layout_preset) { $payload.layout_preset.ToString() } else { "compact_right" }
+        $barcodeWidthPct = if ($payload.PSObject.Properties['barcode_width_pct'] -and $payload.barcode_width_pct) { [int]$payload.barcode_width_pct } else { 42 }
         if ($barcodeWidthPct -lt 30) { $barcodeWidthPct = 30 }
         if ($barcodeWidthPct -gt 55) { $barcodeWidthPct = 55 }
 
@@ -319,28 +345,49 @@ try {
             $leftWidth = $contentWidth - $barcodeWidth - 6
         }
 
-        $g.DrawString($productNumber, $fontSku, $black, $textX, $y)
-        $titleY = $y + 16
-        $titleRect = New-Object System.Drawing.RectangleF($textX, $titleY, $leftWidth, 28)
-        $g.DrawString($productName, $fontTitle, $black, $titleRect)
+        $opnX = [int]$offProductNumber.x; $opnY = [int]$offProductNumber.y; $opnS = [double]$offProductNumber.scale
+        $opdX = [int]$offProductName.x; $opdY = [int]$offProductName.y; $opdS = [double]$offProductName.scale
+        $obcX = [int]$offBarcode.x; $obcY = [int]$offBarcode.y; $obcS = [double]$offBarcode.scale
+        $odtX = [int]$offDetails.x; $odtY = [int]$offDetails.y; $odtS = [double]$offDetails.scale
+        $ontX = [int]$offNotes.x; $ontY = [int]$offNotes.y; $ontS = [double]$offNotes.scale
 
-        Draw-Code128B -Graphics $g -Text $barcode -X $barcodeX -Y $y -Width $barcodeWidth -Height 40 -Brush $black
-        $barcodeTextY = $y + 42
-        $barcodeTextRect = New-Object System.Drawing.RectangleF($barcodeX, $barcodeTextY, $barcodeWidth, 12)
+        $skuFont = New-ScaledFont -Font $fontSku -Scale $opnS
+        $titleFont = New-ScaledFont -Font $fontTitle -Scale $opdS
+        $detailsFont = New-ScaledFont -Font $fontSmall -Scale $odtS
+        $notesFont = New-ScaledFont -Font $fontSmall -Scale $ontS
+        $barcodeFontScaled = New-ScaledFont -Font $fontBarcode -Scale $obcS
+
+        $skuX = [int]($textX + $opnX); $skuY = [int]($y + $opnY)
+        $g.DrawString($productNumber, $skuFont, $black, $skuX, $skuY)
+        $titleY = [int]($y + 16 + $opdY)
+        $titleX = [int]($textX + $opdX)
+        $titleRect = New-Object System.Drawing.RectangleF($titleX, $titleY, $leftWidth, 28)
+        $g.DrawString($productName, $titleFont, $black, $titleRect)
+
+        $barcodeDrawWidth = [int]($barcodeWidth * $obcS)
+        $barcodeDrawHeight = [int](40 * $obcS)
+        $barcodeDrawX = [int]($barcodeX + $obcX)
+        $barcodeDrawY = [int]($y + $obcY)
+        Draw-Code128B -Graphics $g -Text $barcode -X $barcodeDrawX -Y $barcodeDrawY -Width $barcodeDrawWidth -Height $barcodeDrawHeight -Brush $black
+        $barcodeTextY = [int]($y + $obcY + $barcodeDrawHeight + 2)
+        $barcodeTextRect = New-Object System.Drawing.RectangleF($barcodeDrawX, $barcodeTextY, $barcodeDrawWidth, 12)
         $barcodeFormat = New-Object System.Drawing.StringFormat
         $barcodeFormat.Alignment = [System.Drawing.StringAlignment]::Center
-        $g.DrawString($barcode, $fontBarcode, $black, $barcodeTextRect, $barcodeFormat)
+        $g.DrawString($barcode, $barcodeFontScaled, $black, $barcodeTextRect, $barcodeFormat)
 
         $y += 52
         $colW = [Math]::Floor($contentWidth / 3)
-        $g.DrawString("QTY $quantity", $fontSmall, $black, $x, $y)
-        $g.DrawString("TYPE $itemType", $fontSmall, $black, $x + $colW, $y)
-        $g.DrawString("WT $weight", $fontSmall, $black, $x + ($colW * 2), $y)
+        $detailsX = [int]($x + $odtX)
+        $detailsY = [int]($y + $odtY)
+        $g.DrawString("QTY $quantity", $detailsFont, $black, $detailsX, $detailsY)
+        $g.DrawString("TYPE $itemType", $detailsFont, $black, [int]($detailsX + $colW), $detailsY)
+        $g.DrawString("WT $weight", $detailsFont, $black, [int]($detailsX + ($colW * 2)), $detailsY)
         $y += 12
 
         if ($notes.Length -gt 0) {
-            $rect = New-Object System.Drawing.RectangleF($x, $y, $contentWidth, 26)
-            $g.DrawString("Notes: $notes", $fontSmall, $black, $rect)
+            $notesX = [int]($x + $ontX); $notesY = [int]($y + $ontY)
+            $rect = New-Object System.Drawing.RectangleF($notesX, $notesY, $contentWidth, 26)
+            $g.DrawString("Notes: $notes", $notesFont, $black, $rect)
         }
 
         $e.HasMorePages = $false

@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 
+type LayoutFieldKey = 'product_number' | 'product_name' | 'barcode' | 'details' | 'notes'
+
+type LayoutOffset = {
+  x: number
+  y: number
+  scale: number
+}
+
 type LabelPayload = {
   product_number: string
   product_name: string
@@ -19,6 +27,7 @@ type LabelPayload = {
   driver_media_name: string
   printer_profile: string
   zpl_dpi: number
+  layout_offsets: Record<LayoutFieldKey, LayoutOffset>
 }
 
 type Printer = {
@@ -75,6 +84,13 @@ const form = reactive<LabelPayload>({
   driver_media_name: '62mm',
   printer_profile: 'brother_ql_windows',
   zpl_dpi: 203,
+  layout_offsets: {
+    product_number: { x: 0, y: 0, scale: 1 },
+    product_name: { x: 0, y: 0, scale: 1 },
+    barcode: { x: 0, y: 0, scale: 1 },
+    details: { x: 0, y: 0, scale: 1 },
+    notes: { x: 0, y: 0, scale: 1 },
+  },
 })
 
 const printers = ref<Printer[]>([])
@@ -92,6 +108,14 @@ const templateName = ref('')
 const templateSearch = ref('')
 const newTemplatesCount = ref(0)
 const driverLoading = ref(false)
+const selectedLayoutField = ref<LayoutFieldKey>('barcode')
+const layoutFields: Array<{ key: LayoutFieldKey; label: string }> = [
+  { key: 'product_number', label: 'Product Number' },
+  { key: 'product_name', label: 'Product Name' },
+  { key: 'barcode', label: 'Barcode' },
+  { key: 'details', label: 'Qty / Type / Weight' },
+  { key: 'notes', label: 'Notes' },
+]
 
 const selectedPrinter = computed(() => printers.value.find((printer) => printer.Name === form.printer_name))
 const brotherInstalled = computed(() => printers.value.some((printer) => printer.Name.toLowerCase().includes('brother') || printer.DriverName.toLowerCase().includes('brother')))
@@ -125,20 +149,54 @@ const filteredTemplates = computed(() => {
     return fields.some((field) => (field || '').toLowerCase().includes(query))
   })
 })
-const previewKey = computed(() => `${form.label_width_mm}-${form.label_length_mm}-${form.layout_preset}-${form.barcode_width_pct}-${form.product_number}-${form.product_name}-${form.barcode}`)
+const previewKey = computed(() => `${form.label_width_mm}-${form.label_length_mm}-${form.layout_preset}-${JSON.stringify(form.layout_offsets)}-${form.product_number}-${form.product_name}-${form.barcode}`)
 const labelTapeStyle = computed(() => {
   const width = Math.min(900, Math.max(320, form.label_length_mm * 9))
   const height = Math.min(320, Math.max(145, form.label_width_mm * 2.35))
   return {
     width: `${width}px`,
     minHeight: `${height}px`,
-    gridTemplateColumns: ['stacked', 'barcode_bottom', 'minimal'].includes(form.layout_preset) ? '1fr' : `minmax(0, ${100 - form.barcode_width_pct}fr) ${form.barcode_width_pct}fr`,
+    gridTemplateColumns: ['stacked', 'barcode_bottom', 'minimal'].includes(form.layout_preset) ? '1fr' : 'minmax(0, 58fr) 42fr',
   }
 })
-const barcodeBoxStyle = computed(() => {
-  if (!['stacked', 'barcode_bottom', 'minimal'].includes(form.layout_preset)) return {}
-  return { width: `${Math.min(100, form.barcode_width_pct + 45)}%` }
-})
+
+function fieldStyle(field: LayoutFieldKey) {
+  const offset = form.layout_offsets[field]
+  return {
+    transform: `translate(${offset.x}px, ${offset.y}px) scale(${offset.scale})`,
+    transformOrigin: 'top left',
+  }
+}
+
+function nudgeField(dx: number, dy: number) {
+  const field = form.layout_offsets[selectedLayoutField.value]
+  field.x += dx
+  field.y += dy
+}
+
+function scaleField(delta: number) {
+  const field = form.layout_offsets[selectedLayoutField.value]
+  field.scale = Math.min(1.5, Math.max(0.65, Number((field.scale + delta).toFixed(2))))
+}
+
+function resetField() {
+  form.layout_offsets[selectedLayoutField.value] = { x: 0, y: 0, scale: 1 }
+}
+
+function resetLayoutOffsets() {
+  for (const field of layoutFields) {
+    form.layout_offsets[field.key] = { x: 0, y: 0, scale: 1 }
+  }
+}
+
+function ensureLayoutOffsets() {
+  if (!form.layout_offsets) form.layout_offsets = {} as Record<LayoutFieldKey, LayoutOffset>
+  for (const field of layoutFields) {
+    if (!form.layout_offsets[field.key]) {
+      form.layout_offsets[field.key] = { x: 0, y: 0, scale: 1 }
+    }
+  }
+}
 
 const code128Patterns = [
   '212222','222122','222221','121223','121322','131222','122213','122312','132212','221213','221312','231212','112232','122132','122231','113222','123122','123221','223211','221132','221231','213212','223112','312131','311222','321122','321221','312212','322112','322211','212123','212321','232121','111323','131123','131321','112313','132113','132311','211313','231113','231311','112133','112331','132131','113123','113321','133121','313121','211331','231131','213113','213311','213131','311123','311321','331121','312113','312311','332111','314111','221411','431111','111224','111422','121124','121421','141122','141221','112214','112412','122114','122411','142112','142211','241211','221114','413111','241112','134111','111242','121142','121241','114212','124112','124211','411212','421112','421211','212141','214121','412121','111143','111341','131141','114113','114311','411113','411311','113141','114131','311141','411131','211412','211214','211232','2331112'
@@ -282,6 +340,7 @@ async function saveCurrentTemplate() {
 
 function loadTemplate(template: LabelTemplate) {
   Object.assign(form, template.label)
+  ensureLayoutOffsets()
   activeTab.value = 'designer'
   statusMessage.value = `Loaded template: ${template.name}`
 }
@@ -486,16 +545,8 @@ onMounted(async () => {
           </label>
 
           <label class="full">
-            Item Type
-            <select v-model="form.item_type">
-              <option>METALLIC COMPONENT</option>
-              <option>POLYMERIC SEAL</option>
-              <option>ASSEMBLY KIT</option>
-              <option>FASTENER</option>
-              <option>BOX</option>
-              <option>BOTTLE</option>
-              <option>PACK</option>
-            </select>
+            Item Type / Additional Data
+            <input v-model="form.item_type" placeholder="Type, category, batch, location, etc." />
           </label>
 
           <label class="full">
@@ -559,10 +610,25 @@ onMounted(async () => {
                   <option value="minimal">Minimal: SKU + barcode only</option>
                 </select>
               </label>
+            </div>
+
+            <div class="layout-tuner">
               <label>
-                Barcode Width {{ form.barcode_width_pct }}%
-                <input v-model.number="form.barcode_width_pct" min="30" max="55" step="1" type="range" />
+                Move Field
+                <select v-model="selectedLayoutField">
+                  <option v-for="field in layoutFields" :key="field.key" :value="field.key">{{ field.label }}</option>
+                </select>
               </label>
+              <div class="nudge-pad">
+                <button class="ghost" type="button" @click="nudgeField(0, -2)">UP</button>
+                <button class="ghost" type="button" @click="nudgeField(-2, 0)">LEFT</button>
+                <button class="ghost" type="button" @click="nudgeField(2, 0)">RIGHT</button>
+                <button class="ghost" type="button" @click="nudgeField(0, 2)">DOWN</button>
+                <button class="ghost" type="button" @click="scaleField(-0.05)">SIZE -</button>
+                <button class="ghost" type="button" @click="scaleField(0.05)">SIZE +</button>
+                <button class="ghost" type="button" @click="resetField">RESET FIELD</button>
+                <button class="ghost danger" type="button" @click="resetLayoutOffsets">RESET LAYOUT</button>
+              </div>
             </div>
 
             <label>
@@ -604,11 +670,11 @@ onMounted(async () => {
             <div class="tape-meta top">Brother QL / {{ form.driver_media_name || selectedMedia }} / Code128</div>
             <div class="label-left">
               <div>
-                <div class="sku">{{ form.product_number || 'SKU-000' }}</div>
-                <div class="product">{{ form.product_name || 'Product name' }}</div>
+                <div class="sku" :style="fieldStyle('product_number')">{{ form.product_number || 'SKU-000' }}</div>
+                <div class="product" :style="fieldStyle('product_name')">{{ form.product_name || 'Product name' }}</div>
               </div>
 
-              <div class="label-data">
+              <div class="label-data" :style="fieldStyle('details')">
                 <div>
                   <span>ITEM TYPE</span>
                   <strong>{{ form.item_type || 'TYPE' }}</strong>
@@ -623,12 +689,12 @@ onMounted(async () => {
                 </div>
                 <div>
                   <span>NOTES</span>
-                  <strong>{{ form.notes || 'NONE' }}</strong>
+                  <strong :style="fieldStyle('notes')">{{ form.notes || 'NONE' }}</strong>
                 </div>
               </div>
             </div>
 
-            <div class="barcode-box" :style="barcodeBoxStyle">
+            <div class="barcode-box" :style="fieldStyle('barcode')">
               <div class="barcode">
                 <i
                   v-for="(bar, index) in barcodeBars"
@@ -666,8 +732,8 @@ onMounted(async () => {
             <strong>62mm continuous / app controls cut length</strong>
           </div>
           <div>
-            <span>BARCODE</span>
-            <strong>Code128, recommended width 38-45%</strong>
+            <span>POSITIONING</span>
+            <strong>Use Layout Tuning arrows to nudge fields safely</strong>
           </div>
           <div>
             <span>LAYOUT</span>
