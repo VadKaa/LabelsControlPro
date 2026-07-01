@@ -107,7 +107,7 @@ const form = reactive<LabelPayload>({
   barcode_height_pct: 42,
   show_qr: false,
   driver_media_name: '62mm',
-  printer_profile: 'brother_ql_windows',
+  printer_profile: 'brother_ql_raster',
   zpl_dpi: 203,
   print_orientation: 'horizontal',
   display_options: {
@@ -178,7 +178,8 @@ const printerOnline = computed(() => {
 const statusLabel = computed(() => printerOnline.value ? 'ONLINE' : 'OFFLINE')
 const statusClass = computed(() => printerOnline.value ? 'online' : 'offline')
 const printerProfiles = [
-  { id: 'brother_ql_windows', name: 'Brother QL via Windows Driver', status: 'Active', note: 'Current stable path for QL-820NWB and other Brother QL printers installed in Windows.' },
+  { id: 'brother_ql_raster', name: 'Brother QL Raster Direct', status: 'Recommended', note: 'Bypasses Windows layout/scaling by sending Brother QL raster commands through the Windows RAW queue. Use this for QL-820NWB to avoid Windows media-size mismatch.' },
+  { id: 'brother_ql_windows', name: 'Brother QL via Windows Driver', status: 'Legacy', note: 'Uses the Windows/Brother driver. Can be affected by Windows Printing Preferences and media mismatch.' },
   { id: 'zebra_zpl', name: 'Zebra ZPL', status: 'Active', note: 'Direct ZPL output for Zebra GK/ZD/ZT/LP/TLP label printers through a Windows RAW printer queue.' },
   { id: 'epson_windows', name: 'Epson Label via Windows Driver', status: 'Active', note: 'Preset for Epson/Seiko label printers installed as normal Windows queues.' },
   { id: 'generic_windows', name: 'Generic Windows Printer', status: 'Active', note: 'Fallback path for installed Windows printers using standard driver printing and selected media.' },
@@ -256,6 +257,20 @@ function fieldStyle(field: LayoutFieldKey) {
     fontStyle: font?.italic ? 'italic' : undefined,
   }
 }
+
+function objectStyle(field: LayoutFieldKey, xMm: number, yMm: number, widthMm: number, heightMm: number) {
+  const base = fieldStyle(field)
+  return {
+    ...base,
+    left: `${xMm * previewScale.value.x}px`,
+    top: `${yMm * previewScale.value.y}px`,
+    width: `${widthMm * previewScale.value.x}px`,
+    height: `${heightMm * previewScale.value.y}px`,
+  }
+}
+
+const barcodeObjectStyle = computed(() => objectStyle('barcode', 13, 43, 32, 11))
+const qrObjectStyle = computed(() => objectStyle('qr_code', 48, 5, 10, 10))
 
 const barcodeStyle = computed(() => ({
   height: `${barcodeHeightPx.value}px`,
@@ -577,49 +592,113 @@ async function runDriverAction(action: 'install' | 'uninstall') {
 }
 
 async function generatePreviewImageDataUrl() {
-  const label = document.querySelector('.label-tape') as HTMLElement | null
-  if (!label) return ''
+  const scale = 2
+  const width = Math.max(1, Math.round(previewSize.value.width * scale))
+  const height = Math.max(1, Math.round(previewSize.value.height * scale))
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return ''
 
-  const rect = label.getBoundingClientRect()
-  const clone = label.cloneNode(true) as HTMLElement
-  clone.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml')
-  clone.querySelectorAll('.printable-safe-area, .tape-meta').forEach((element) => element.remove())
-  clone.querySelectorAll('.selected').forEach((element) => element.classList.remove('selected'))
-  clone.style.width = `${rect.width}px`
-  clone.style.height = `${rect.height}px`
-  clone.style.minHeight = `${rect.height}px`
-  clone.style.margin = '0'
-  clone.style.boxSizing = 'border-box'
+  const sx = previewScale.value.x * scale
+  const sy = previewScale.value.y * scale
+  const px = (mm: number) => mm * sx
+  const py = (mm: number) => mm * sy
+  const fieldX = (field: LayoutFieldKey, base: number) => px(base + form.layout_offsets[field].x)
+  const fieldY = (field: LayoutFieldKey, base: number) => py(base + form.layout_offsets[field].y)
 
-  let css = ''
-  for (const sheet of Array.from(document.styleSheets)) {
-    try {
-      css += Array.from(sheet.cssRules).map((rule) => rule.cssText).join('\n')
-    } catch {
-      // Ignore cross-origin stylesheets; computed layout still remains in the cloned markup.
-    }
+  function applyFont(field: LayoutFieldKey, fallbackSize: number) {
+    const font = form.font_settings[field]
+    const size = (font?.size || fallbackSize) * scale * form.layout_offsets[field].scale
+    const style = font?.italic ? 'italic ' : ''
+    const weight = font?.bold ? '900 ' : '400 '
+    const family = font?.family || 'Arial'
+    ctx.font = `${style}${weight}${size}px ${family}`
+    ctx.fillStyle = '#020617'
+    ctx.textBaseline = 'top'
   }
 
-  const html = `<style>${css}</style>${clone.outerHTML}`
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${rect.width}" height="${rect.height}"><foreignObject width="100%" height="100%">${html}</foreignObject></svg>`
-  const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+  function clipText(text: string, x: number, y: number, w: number, h: number, field: LayoutFieldKey, size: number) {
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(x, y, w, h)
+    ctx.clip()
+    applyFont(field, size)
+    ctx.fillText(text, x, y)
+    ctx.restore()
+  }
 
-  return await new Promise<string>((resolve) => {
-    const image = new Image()
-    image.onload = () => {
-      const canvas = document.createElement('canvas')
-      canvas.width = Math.max(1, Math.round(rect.width * 2))
-      canvas.height = Math.max(1, Math.round(rect.height * 2))
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return resolve('')
-      ctx.fillStyle = '#ffffff'
-      ctx.fillRect(0, 0, canvas.width, canvas.height)
-      ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
-      resolve(canvas.toDataURL('image/png'))
-    }
-    image.onerror = () => resolve('')
-    image.src = svgUrl
-  })
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, width, height)
+
+  if (form.display_options.product_number) {
+    clipText(form.product_number || 'SKU-000', fieldX('product_number', 4), fieldY('product_number', 5), px(24), py(8), 'product_number', 27)
+  }
+  if (form.display_options.product_name) {
+    clipText(form.product_name || 'Product name', fieldX('product_name', 4), fieldY('product_name', 52), px(40), py(8), 'product_name', 14)
+  }
+
+  applyFont('details', 9)
+  const detailsY = fieldY('details', 24)
+  const detailsX = fieldX('details', 4)
+  const col = px(12)
+  if (form.display_options.item_type) {
+    ctx.fillText('ITEM TYPE', detailsX, detailsY)
+    ctx.fillText(form.item_type || 'TYPE', detailsX, detailsY + py(4))
+  }
+  if (form.display_options.weight) {
+    ctx.fillText('WEIGHT', detailsX + col, detailsY)
+    ctx.fillText(form.weight || '0 KG', detailsX + col, detailsY + py(4))
+  }
+  if (form.display_options.quantity) {
+    ctx.fillText('QTY', detailsX + col * 2, detailsY)
+    ctx.fillText(String(form.quantity), detailsX + col * 2, detailsY + py(4))
+  }
+
+  if (form.display_options.notes) {
+    applyFont('notes', 9)
+    const nx = fieldX('notes', 40)
+    const ny = fieldY('notes', 24)
+    ctx.fillText('NOTES', nx, ny)
+    ctx.fillText(form.notes || 'NONE', nx, ny + py(4))
+  }
+
+  if (form.display_options.barcode) {
+    const bx = fieldX('barcode', 13)
+    const by = fieldY('barcode', 43)
+    const bw = px(32) * form.layout_offsets.barcode.scale
+    const bh = barcodeHeightPx.value * scale * form.layout_offsets.barcode.scale
+    const total = barcodeBars.value.reduce((sum, bar) => sum + bar, 0)
+    let x = bx
+    ctx.fillStyle = '#020617'
+    barcodeBars.value.forEach((bar, index) => {
+      const barWidth = Math.max(1, (bar / total) * bw)
+      if (index % 2 === 0) ctx.fillRect(x, by, barWidth, bh)
+      x += barWidth
+    })
+    applyFont('barcode', 8)
+    ctx.textAlign = 'center'
+    ctx.fillText(form.barcode || '123456789012', bx + bw / 2, by + bh + py(1))
+    ctx.textAlign = 'left'
+  }
+
+  if (form.show_qr) {
+    const qx = fieldX('qr_code', 48)
+    const qy = fieldY('qr_code', 5)
+    const cell = Math.max(1, px(0.75) * form.layout_offsets.qr_code.scale)
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(qx, qy, cell * 13, cell * 13)
+    ctx.fillStyle = '#020617'
+    qrCells.value.forEach((filled, index) => {
+      if (!filled) return
+      const colIndex = index % 11
+      const rowIndex = Math.floor(index / 11)
+      ctx.fillRect(qx + cell + colIndex * cell, qy + cell + rowIndex * cell, cell, cell)
+    })
+  }
+
+  return canvas.toDataURL('image/png')
 }
 
 async function submitLabel() {
@@ -630,8 +709,16 @@ async function submitLabel() {
   printCopies.value = normalizedPrintCopies.value
 
   try {
+    if (form.printer_profile === 'brother_ql_windows' && form.printer_name.toLowerCase().includes('brother')) {
+      form.printer_profile = 'brother_ql_raster'
+      statusMessage.value = 'Switched to Brother QL Raster Direct to avoid Windows media-size mismatch.'
+    }
+
     const totalCopies = normalizedPrintCopies.value
     const previewImageDataUrl = await generatePreviewImageDataUrl()
+    if (form.printer_profile === 'brother_ql_raster' && !previewImageDataUrl) {
+      throw new Error('Could not generate preview image for Brother QL Raster Direct')
+    }
 
     for (let copy = 1; copy <= totalCopies; copy += 1) {
       const payload = { ...form, print: true, preview_image_data_url: previewImageDataUrl }
@@ -923,35 +1010,65 @@ onUnmounted(() => {
 
         <div class="canvas-grid">
           <div :key="previewKey" class="label-tape" :class="[form.layout_preset, form.print_orientation]" :style="labelTapeStyle">
-            <div class="tape-meta top">Brother QL / {{ form.driver_media_name || selectedMedia }} / {{ form.print_orientation }} / Code128</div>
+            <div class="tape-meta top">Brother QL / {{ form.driver_media_name || selectedMedia }} / {{ form.print_orientation }} / CODE128</div>
             <div v-if="form.printer_profile === 'brother_ql_windows'" class="printable-safe-area" :style="printableSafeStyle"></div>
-            <div class="label-left">
-              <div>
-                <div v-if="form.display_options.product_number" class="sku draggable-field" :class="{ selected: selectedLayoutField === 'product_number' }" :style="fieldStyle('product_number')" @pointerdown.stop.prevent="startDrag('product_number', $event)">{{ form.product_number || 'SKU-000' }}</div>
-                <div v-if="form.display_options.product_name" class="product draggable-field" :class="{ selected: selectedLayoutField === 'product_name' }" :style="fieldStyle('product_name')" @pointerdown.stop.prevent="startDrag('product_name', $event)">{{ form.product_name || 'Product name' }}</div>
-              </div>
 
-              <div class="label-data draggable-field" :class="{ selected: selectedLayoutField === 'details' }" :style="fieldStyle('details')" @pointerdown.stop.prevent="startDrag('details', $event)">
-                <div v-if="form.display_options.item_type">
-                  <span>ITEM TYPE</span>
-                  <strong>{{ form.item_type || 'TYPE' }}</strong>
-                </div>
-                <div v-if="form.display_options.weight">
-                  <span>WEIGHT</span>
-                  <strong>{{ form.weight || '0 KG' }}</strong>
-                </div>
-                <div v-if="form.display_options.quantity">
-                  <span>QTY</span>
-                  <strong>{{ form.quantity }}</strong>
-                </div>
-                <div v-if="form.display_options.notes">
-                  <span>NOTES</span>
-                  <strong class="draggable-field" :class="{ selected: selectedLayoutField === 'notes' }" :style="fieldStyle('notes')" @pointerdown.stop.prevent="startDrag('notes', $event)">{{ form.notes || 'NONE' }}</strong>
-                </div>
+            <div
+              v-if="form.display_options.product_number"
+              class="label-object sku draggable-field"
+              :class="{ selected: selectedLayoutField === 'product_number' }"
+              :style="objectStyle('product_number', 4, 5, 20, 7)"
+              @pointerdown.stop.prevent="startDrag('product_number', $event)"
+            >{{ form.product_number || 'SKU-000' }}</div>
+
+            <div
+              v-if="form.display_options.product_name"
+              class="label-object product draggable-field"
+              :class="{ selected: selectedLayoutField === 'product_name' }"
+              :style="objectStyle('product_name', 4, 52, 38, 7)"
+              @pointerdown.stop.prevent="startDrag('product_name', $event)"
+            >{{ form.product_name || 'Product name' }}</div>
+
+            <div
+              class="label-object label-data absolute-data draggable-field"
+              :class="{ selected: selectedLayoutField === 'details' }"
+              :style="objectStyle('details', 4, 24, 34, 12)"
+              @pointerdown.stop.prevent="startDrag('details', $event)"
+            >
+              <div v-if="form.display_options.item_type">
+                <span>ITEM TYPE</span>
+                <strong>{{ form.item_type || 'TYPE' }}</strong>
+              </div>
+              <div v-if="form.display_options.weight">
+                <span>WEIGHT</span>
+                <strong>{{ form.weight || '0 KG' }}</strong>
+              </div>
+              <div v-if="form.display_options.quantity">
+                <span>QTY</span>
+                <strong>{{ form.quantity }}</strong>
               </div>
             </div>
 
-            <div v-if="form.display_options.barcode" class="barcode-box draggable-field" :class="{ selected: selectedLayoutField === 'barcode' }" :style="fieldStyle('barcode')" @pointerdown.stop.prevent="startDrag('barcode', $event)">
+            <div
+              v-if="form.display_options.notes"
+              class="label-object label-data notes-object draggable-field"
+              :class="{ selected: selectedLayoutField === 'notes' }"
+              :style="objectStyle('notes', 40, 24, 16, 12)"
+              @pointerdown.stop.prevent="startDrag('notes', $event)"
+            >
+              <div>
+                <span>NOTES</span>
+                <strong>{{ form.notes || 'NONE' }}</strong>
+              </div>
+            </div>
+
+            <div
+              v-if="form.display_options.barcode"
+              class="label-object barcode-box draggable-field"
+              :class="{ selected: selectedLayoutField === 'barcode' }"
+              :style="barcodeObjectStyle"
+              @pointerdown.stop.prevent="startDrag('barcode', $event)"
+            >
               <div class="barcode" :style="barcodeStyle">
                 <i
                   v-for="(bar, index) in barcodeBars"
@@ -962,7 +1079,7 @@ onUnmounted(() => {
               <div class="barcode-text">{{ form.barcode || '123456789012' }}</div>
             </div>
 
-            <div v-if="form.show_qr" class="qr-code draggable-field" :class="{ selected: selectedLayoutField === 'qr_code' }" :style="fieldStyle('qr_code')" title="QR preview" @pointerdown.stop.prevent="startDrag('qr_code', $event)">
+            <div v-if="form.show_qr" class="label-object qr-code draggable-field" :class="{ selected: selectedLayoutField === 'qr_code' }" :style="qrObjectStyle" title="QR preview" @pointerdown.stop.prevent="startDrag('qr_code', $event)">
               <i v-for="(filled, index) in qrCells" :key="index" :class="{ filled }"></i>
             </div>
           </div>

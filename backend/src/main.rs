@@ -412,6 +412,7 @@ fn print_label(payload: &LabelRequest) -> serde_json::Value {
         .join("..")
         .join("scripts");
     let script_path = scripts_dir.join("print_label.ps1");
+    let brother_ql_script_path = scripts_dir.join("print_label_brother_ql.py");
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -427,21 +428,66 @@ fn print_label(payload: &LabelRequest) -> serde_json::Value {
     }
 
     let printer_name = payload.printer_name.clone().unwrap_or_default();
-    let output = Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(script_path)
-        .arg("-PayloadPath")
-        .arg(&payload_path)
-        .arg("-PrinterName")
-        .arg(printer_name)
-        .arg("-LabelWidthMm")
-        .arg(payload.label_width_mm.to_string())
-        .arg("-LabelLengthMm")
-        .arg(payload.label_length_mm.to_string())
-        .output();
+    let output = if payload.printer_profile == "brother_ql_raster" {
+        let mut python_candidates = Vec::new();
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            python_candidates.push(format!(
+                "{}\\Programs\\Python\\Python312\\python.exe",
+                local_app_data
+            ));
+        }
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            python_candidates.push(format!("{}\\Python312\\python.exe", program_files));
+        }
+        python_candidates.push("py".to_string());
+        python_candidates.push("python".to_string());
+
+        let mut last_error = None;
+        let mut last_output = None;
+        for python in python_candidates {
+            match Command::new(&python)
+                .arg(&brother_ql_script_path)
+                .arg("--payload")
+                .arg(&payload_path)
+                .arg("--printer")
+                .arg(&printer_name)
+                .arg("--width-mm")
+                .arg(payload.label_width_mm.to_string())
+                .arg("--length-mm")
+                .arg(payload.label_length_mm.to_string())
+                .output()
+            {
+                Ok(result) => {
+                    if result.status.success() {
+                        last_output = Some(result);
+                        break;
+                    }
+                    last_output = Some(result);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match last_output {
+            Some(result) => Ok(result),
+            None => Err(last_error.expect("python command attempted")),
+        }
+    } else {
+        Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(script_path)
+            .arg("-PayloadPath")
+            .arg(&payload_path)
+            .arg("-PrinterName")
+            .arg(printer_name)
+            .arg("-LabelWidthMm")
+            .arg(payload.label_width_mm.to_string())
+            .arg("-LabelLengthMm")
+            .arg(payload.label_length_mm.to_string())
+            .output()
+    };
 
     let _ = fs::remove_file(payload_path);
 

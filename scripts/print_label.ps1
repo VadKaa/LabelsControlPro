@@ -132,6 +132,74 @@ function Get-FieldFont {
     return New-Object System.Drawing.Font($family, $size, $fontStyle)
 }
 
+function Set-BrotherQlPrintPreferences {
+    param([string]$PrinterName, [double]$LabelWidthMm, [double]$LabelLengthMm)
+    if ([string]::IsNullOrWhiteSpace($PrinterName)) { return $false }
+    try {
+        $config = Get-PrintConfiguration -PrinterName $PrinterName -ErrorAction Stop
+        if (-not $config.PrintTicketXML) { return $false }
+        [xml]$ticket = $config.PrintTicketXML
+        $nsmgr = New-Object System.Xml.XmlNamespaceManager($ticket.NameTable)
+        $nsmgr.AddNamespace("psf", "http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework")
+        $nsmgr.AddNamespace("psk", "http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords")
+        $brotherPrefix = "ns0001"
+        foreach ($attr in $ticket.DocumentElement.Attributes) {
+            if ($attr.Name -like "xmlns:*" -and $attr.Value -like "http://schemas.brother.info/*") {
+                $brotherPrefix = $attr.Name.Substring(6)
+                $nsmgr.AddNamespace($brotherPrefix, $attr.Value)
+                break
+            }
+        }
+
+        $widthMicrons = [int][Math]::Round($LabelWidthMm * 1000)
+        $heightMicrons = [int][Math]::Round($LabelLengthMm * 1000)
+        $mediaOptionName = switch ([int][Math]::Round($LabelWidthMm)) {
+            38 { "$brotherPrefix`:CustomMediaSize304" }
+            50 { "$brotherPrefix`:CustomMediaSize294" }
+            54 { "$brotherPrefix`:CustomMediaSize293" }
+            62 { "$brotherPrefix`:CustomMediaSize291" }
+            default { "$brotherPrefix`:CustomMediaSize291" }
+        }
+
+        $mediaFeature = $ticket.SelectSingleNode("//psf:Feature[@name='psk:PageMediaSize']", $nsmgr)
+        if ($null -eq $mediaFeature) { return $false }
+        $option = $mediaFeature.SelectSingleNode("psf:Option", $nsmgr)
+        if ($null -eq $option) {
+            $option = $ticket.CreateElement("psf", "Option", $nsmgr.LookupNamespace("psf"))
+            $mediaFeature.AppendChild($option) | Out-Null
+        }
+        $option.SetAttribute("name", $mediaOptionName)
+
+        foreach ($propName in @("psk:MediaSizeWidth", "psk:MediaSizeHeight", "$brotherPrefix`:MediaSizeHeightOffset")) {
+            $prop = $option.SelectSingleNode("psf:ScoredProperty[@name='$propName']", $nsmgr)
+            if ($null -eq $prop) {
+                $prop = $ticket.CreateElement("psf", "ScoredProperty", $nsmgr.LookupNamespace("psf"))
+                $prop.SetAttribute("name", $propName)
+                $option.AppendChild($prop) | Out-Null
+            }
+            $value = $prop.SelectSingleNode("psf:Value", $nsmgr)
+            if ($null -eq $value) {
+                $value = $ticket.CreateElement("psf", "Value", $nsmgr.LookupNamespace("psf"))
+                $value.SetAttribute("type", "http://www.w3.org/2001/XMLSchema-instance", "xsd:integer")
+                $prop.AppendChild($value) | Out-Null
+            }
+            if ($propName -eq "psk:MediaSizeWidth") { $value.InnerText = $widthMicrons.ToString() }
+            elseif ($propName -eq "psk:MediaSizeHeight") { $value.InnerText = $heightMicrons.ToString() }
+            else { $value.InnerText = "3000" }
+        }
+
+        $orientation = $ticket.SelectSingleNode("//psf:Feature[@name='psk:PageOrientation']/psf:Option", $nsmgr)
+        if ($null -ne $orientation) { $orientation.SetAttribute("name", "psk:Landscape") }
+
+        Set-PrintConfiguration -PrinterName $PrinterName -PrintTicketXml $ticket.OuterXml -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-Warning "Could not update Brother printer preferences: $_"
+        return $false
+    }
+}
+
 function Send-RawToPrinter {
     param([string]$PrinterName, [string]$DocumentName, [string]$Data)
     $signature = @"
@@ -264,21 +332,28 @@ try {
         throw "Zebra ZPL profile is planned but not active yet. Select Brother QL or Generic Windows."
     }
 
-    # Prefer the exact driver media selected in the interface.
+    # Do not change global Brother Printing Preferences here. Changing the saved PrintTicket can
+    # make the driver report "wrong tape size" until preferences are manually fixed. Instead,
+    # choose the correct per-job PaperSize below.
+    $preferencesUpdated = $false
+
+    # Prefer an exact per-job media size first.
     # Brother QL drivers validate the installed roll against the selected PaperSize RawKind.
     # For Brother continuous tape, use the driver's own "62mm" paper size object exactly;
     # do not create a custom "62mm x 60mm" PaperSize or the driver can report a roll mismatch.
-    if (-not [string]::IsNullOrWhiteSpace($driverMediaName)) {
+    foreach ($size in $settings.PaperSizes) {
+        $widthMatches = [Math]::Abs($size.Width - $labelWidthHi) -le 2
+        $lengthMatches = [Math]::Abs($size.Height - $labelLengthHi) -le 4
+        if ($widthMatches -and $lengthMatches) {
+            $paperSize = $size
+            break
+        }
+    }
+
+    if (($null -eq $paperSize) -and -not [string]::IsNullOrWhiteSpace($driverMediaName)) {
         foreach ($size in $settings.PaperSizes) {
             if ($size.PaperName -eq $driverMediaName) {
-                if ($printerProfile -eq "brother_ql_windows") {
-                    # Brother QL continuous tape length must come from the app label_length_mm,
-                    # not from the static length currently selected in Windows Printing Preferences.
-                    # Keep the driver's media identity/RawKind so the 62mm roll is accepted, but
-                    # override the paper height to the requested cut length.
-                    $paperSize = New-Object System.Drawing.Printing.PaperSize($size.PaperName, $labelWidthHi, $labelLengthHi)
-                    try { $paperSize.RawKind = $size.RawKind } catch { }
-                } elseif ($driverMediaName -match '^\d+mm$') {
+                if ($driverMediaName -match '^\d+mm$') {
                     $paperSize = New-Object System.Drawing.Printing.PaperSize($size.PaperName, $labelWidthHi, $labelLengthHi)
                     try { $paperSize.RawKind = $size.RawKind } catch { }
                 } else {
@@ -289,17 +364,11 @@ try {
         }
     }
 
-    if ($null -eq $paperSize) {
+    if (($null -eq $paperSize) -and ($printerProfile -eq "brother_ql_windows")) {
         foreach ($size in $settings.PaperSizes) {
-            $widthMatches = [Math]::Abs($size.Width - $labelWidthHi) -le 2
-            $lengthMatches = [Math]::Abs($size.Height - $labelLengthHi) -le 4
-            if (($printerProfile -eq "brother_ql_windows" -and $widthMatches) -or ($widthMatches -and $lengthMatches)) {
-                if ($printerProfile -eq "brother_ql_windows") {
-                    $paperSize = New-Object System.Drawing.Printing.PaperSize($size.PaperName, $labelWidthHi, $labelLengthHi)
-                    try { $paperSize.RawKind = $size.RawKind } catch { }
-                } else {
-                    $paperSize = $size
-                }
+            if ($size.PaperName -eq "User Defined Size") {
+                $paperSize = New-Object System.Drawing.Printing.PaperSize($size.PaperName, $labelWidthHi, $labelLengthHi)
+                try { $paperSize.RawKind = $size.RawKind } catch { }
                 break
             }
         }
@@ -371,6 +440,7 @@ try {
                 driver_media_name = $driverMediaName
                 printer_profile = $printerProfile
                 print_orientation = $printOrientation
+                preferences_updated = $preferencesUpdated
             } | ConvertTo-Json -Depth 10
             exit 0
         }
@@ -616,6 +686,7 @@ try {
         driver_media_name = $driverMediaName
         printer_profile = $printerProfile
         print_orientation = $printOrientation
+        preferences_updated = $preferencesUpdated
     }
     $result | ConvertTo-Json -Depth 10
     exit 0
