@@ -77,6 +77,44 @@ function New-ScaledFont {
     return New-Object System.Drawing.Font($Font.FontFamily, [float]($Font.Size * $Scale), $Font.Style)
 }
 
+function Test-DisplayField {
+    param($Payload, [string]$Field)
+    $displayProp = $Payload.PSObject.Properties['display_options']
+    if ($null -eq $displayProp) { return $true }
+    $fieldProp = $displayProp.Value.PSObject.Properties[$Field]
+    if ($null -eq $fieldProp) { return $true }
+    return [bool]$fieldProp.Value
+}
+
+function Get-FieldFont {
+    param($Payload, [string]$Field, [string]$DefaultFamily, [float]$DefaultSize, $Style)
+    $allowedFamilies = @("Arial", "Helvetica", "Times New Roman", "sans-serif", "serif", "monospace", "Consolas", "Courier New", "Verdana", "Tahoma", "Trebuchet MS", "Georgia")
+    $family = $DefaultFamily
+    $size = $DefaultSize
+    $bold = (($Style -band [System.Drawing.FontStyle]::Bold) -eq [System.Drawing.FontStyle]::Bold)
+    $italic = (($Style -band [System.Drawing.FontStyle]::Italic) -eq [System.Drawing.FontStyle]::Italic)
+    $fontProp = $Payload.PSObject.Properties['font_settings']
+    if ($null -ne $fontProp) {
+        $fieldProp = $fontProp.Value.PSObject.Properties[$Field]
+        if ($null -ne $fieldProp) {
+            if ($fieldProp.Value.PSObject.Properties['family'] -and $fieldProp.Value.family) { $family = $fieldProp.Value.family.ToString() }
+            if ($fieldProp.Value.PSObject.Properties['size'] -and $fieldProp.Value.size) { $size = [float]$fieldProp.Value.size }
+            if ($fieldProp.Value.PSObject.Properties['bold']) { $bold = [bool]$fieldProp.Value.bold }
+            if ($fieldProp.Value.PSObject.Properties['italic']) { $italic = [bool]$fieldProp.Value.italic }
+        }
+    }
+    if ($allowedFamilies -notcontains $family) { $family = $DefaultFamily }
+    if ($family -eq "sans-serif") { $family = "Arial" }
+    if ($family -eq "serif") { $family = "Times New Roman" }
+    if ($family -eq "monospace") { $family = "Consolas" }
+    if ($size -lt 5) { $size = 5 }
+    if ($size -gt 36) { $size = 36 }
+    $fontStyle = [System.Drawing.FontStyle]::Regular
+    if ($bold) { $fontStyle = $fontStyle -bor [System.Drawing.FontStyle]::Bold }
+    if ($italic) { $fontStyle = $fontStyle -bor [System.Drawing.FontStyle]::Italic }
+    return New-Object System.Drawing.Font($family, $size, $fontStyle)
+}
+
 function Send-RawToPrinter {
     param([string]$PrinterName, [string]$DocumentName, [string]$Data)
     $signature = @"
@@ -161,18 +199,26 @@ try {
         $weight = if ($payload.weight) { $payload.weight.ToString() } else { "" }
         $barcode = if ($payload.barcode) { $payload.barcode.ToString() } else { $productNumber }
         $notes = if ($payload.notes) { $payload.notes.ToString() } else { "" }
-        $barcodeHeight = [int][Math]::Round($labelLengthDots * 0.34)
+        $barcodeHeightPct = if ($payload.PSObject.Properties['barcode_height_pct'] -and $payload.barcode_height_pct) { [int]$payload.barcode_height_pct } else { 42 }
+        if ($barcodeHeightPct -lt 20) { $barcodeHeightPct = 20 }
+        if ($barcodeHeightPct -gt 80) { $barcodeHeightPct = 80 }
+        $barcodeHeight = [int][Math]::Round($labelLengthDots * ($barcodeHeightPct / 100.0))
         if ($barcodeHeight -lt 70) { $barcodeHeight = 70 }
-        if ($barcodeHeight -gt 150) { $barcodeHeight = 150 }
+        if ($barcodeHeight -gt 220) { $barcodeHeight = 220 }
         $safeBarcode = ($barcode -replace '[\^~]', '')
         $zplOrient = if ($printOrientation -eq "vertical") { "R" } else { "N" }
         $zpl = "^XA`n"
         $zpl += "^CI28`n^PW$labelWidthDots`n^LL$labelLengthDots`n^LH0,0`n"
-        $zpl += "^FO20,18^A0$zplOrient,30,30^FD$productNumber^FS`n"
-        $zpl += "^FO20,52^A0$zplOrient,24,24^FB$($labelWidthDots - 40),2,0,L,0^FD$productName^FS`n"
-        $zpl += "^FO20,105^BY2,2,$barcodeHeight^BC$zplOrient,$barcodeHeight,Y,N,N^FD$safeBarcode^FS`n"
-        $zpl += "^FO20,$($barcodeHeight + 185)^A0$zplOrient,20,20^FDQTY $quantity   TYPE $itemType   WT $weight^FS`n"
-        if ($notes.Length -gt 0) { $zpl += "^FO20,$($barcodeHeight + 212)^A0$zplOrient,18,18^FB$($labelWidthDots - 40),2,0,L,0^FD$notes^FS`n" }
+        if (Test-DisplayField -Payload $payload -Field "product_number") { $zpl += "^FO20,18^A0$zplOrient,30,30^FD$productNumber^FS`n" }
+        if (Test-DisplayField -Payload $payload -Field "product_name") { $zpl += "^FO20,52^A0$zplOrient,24,24^FB$($labelWidthDots - 40),2,0,L,0^FD$productName^FS`n" }
+        if (Test-DisplayField -Payload $payload -Field "barcode") { $zpl += "^FO20,105^BY2,2,$barcodeHeight^BC$zplOrient,$barcodeHeight,Y,N,N^FD$safeBarcode^FS`n" }
+        if ($payload.PSObject.Properties['show_qr'] -and $payload.show_qr) { $zpl += "^FO$($labelWidthDots - 145),20^BQN,2,4^FDLA,$safeBarcode^FS`n" }
+        $details = @()
+        if (Test-DisplayField -Payload $payload -Field "quantity") { $details += "QTY $quantity" }
+        if (Test-DisplayField -Payload $payload -Field "item_type") { $details += "TYPE $itemType" }
+        if (Test-DisplayField -Payload $payload -Field "weight") { $details += "WT $weight" }
+        if ($details.Count -gt 0) { $zpl += "^FO20,$($barcodeHeight + 185)^A0$zplOrient,20,20^FD$($details -join '   ')^FS`n" }
+        if ((Test-DisplayField -Payload $payload -Field "notes") -and $notes.Length -gt 0) { $zpl += "^FO20,$($barcodeHeight + 212)^A0$zplOrient,18,18^FB$($labelWidthDots - 40),2,0,L,0^FD$notes^FS`n" }
         $zpl += "^XZ`n"
         Send-RawToPrinter -PrinterName $settings.PrinterName -DocumentName "Product label ZPL" -Data $zpl
         [ordered]@{ status = "printed"; printer = $settings.PrinterName; printer_profile = $printerProfile; zpl_dpi = $dpi; print_orientation = $printOrientation; label_width_mm = $LabelWidthMm; label_length_mm = $LabelLengthMm } | ConvertTo-Json -Depth 10
@@ -232,11 +278,11 @@ try {
     $doc.DefaultPageSettings.Landscape = ($printOrientation -eq "horizontal")
     $doc.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)
 
-    $fontTitle = New-Object System.Drawing.Font("Arial", 11, [System.Drawing.FontStyle]::Bold)
-    $fontSku = New-Object System.Drawing.Font("Consolas", 10, [System.Drawing.FontStyle]::Bold)
-    $fontText = New-Object System.Drawing.Font("Arial", 7, [System.Drawing.FontStyle]::Regular)
-    $fontSmall = New-Object System.Drawing.Font("Arial", 6, [System.Drawing.FontStyle]::Regular)
-    $fontBarcode = New-Object System.Drawing.Font("Consolas", 7, [System.Drawing.FontStyle]::Bold)
+    $fontTitle = Get-FieldFont -Payload $payload -Field "product_name" -DefaultFamily "Arial" -DefaultSize 11 -Style ([System.Drawing.FontStyle]::Bold)
+    $fontSku = Get-FieldFont -Payload $payload -Field "product_number" -DefaultFamily "Consolas" -DefaultSize 10 -Style ([System.Drawing.FontStyle]::Bold)
+    $fontText = Get-FieldFont -Payload $payload -Field "details" -DefaultFamily "Arial" -DefaultSize 7 -Style ([System.Drawing.FontStyle]::Regular)
+    $fontSmall = Get-FieldFont -Payload $payload -Field "details" -DefaultFamily "Arial" -DefaultSize 6 -Style ([System.Drawing.FontStyle]::Regular)
+    $fontBarcode = Get-FieldFont -Payload $payload -Field "barcode" -DefaultFamily "Consolas" -DefaultSize 7 -Style ([System.Drawing.FontStyle]::Bold)
     $black = [System.Drawing.Brushes]::Black
 
     $handler = [System.Drawing.Printing.PrintPageEventHandler] {
@@ -269,6 +315,10 @@ try {
         $barcodeWidthPct = if ($payload.PSObject.Properties['barcode_width_pct'] -and $payload.barcode_width_pct) { [int]$payload.barcode_width_pct } else { 42 }
         if ($barcodeWidthPct -lt 30) { $barcodeWidthPct = 30 }
         if ($barcodeWidthPct -gt 55) { $barcodeWidthPct = 55 }
+        $barcodeHeightPct = if ($payload.PSObject.Properties['barcode_height_pct'] -and $payload.barcode_height_pct) { [int]$payload.barcode_height_pct } else { 42 }
+        if ($barcodeHeightPct -lt 20) { $barcodeHeightPct = 20 }
+        if ($barcodeHeightPct -gt 80) { $barcodeHeightPct = 80 }
+        $barcodeHeightPx = [int][Math]::Round(18 + ($barcodeHeightPct * 0.65))
 
         if ($layoutPreset -eq "stacked") {
             $g.DrawString($productNumber, $fontSku, $black, $x, $y)
@@ -361,36 +411,58 @@ try {
         $barcodeFontScaled = New-ScaledFont -Font $fontBarcode -Scale $obcS
 
         $skuX = [int]($textX + $opnX); $skuY = [int]($y + $opnY)
-        $g.DrawString($productNumber, $skuFont, $black, $skuX, $skuY)
+        if (Test-DisplayField -Payload $payload -Field "product_number") { $g.DrawString($productNumber, $skuFont, $black, $skuX, $skuY) }
         $titleY = [int]($y + 16 + $opdY)
         $titleX = [int]($textX + $opdX)
         $titleRect = New-Object System.Drawing.RectangleF($titleX, $titleY, $leftWidth, 28)
-        $g.DrawString($productName, $titleFont, $black, $titleRect)
+        if (Test-DisplayField -Payload $payload -Field "product_name") { $g.DrawString($productName, $titleFont, $black, $titleRect) }
 
         $barcodeDrawWidth = [int]($barcodeWidth * $obcS)
-        $barcodeDrawHeight = [int](40 * $obcS)
+        $barcodeDrawHeight = [int]($barcodeHeightPx * $obcS)
         $barcodeDrawX = [int]($barcodeX + $obcX)
         $barcodeDrawY = [int]($y + $obcY)
-        Draw-Code128B -Graphics $g -Text $barcode -X $barcodeDrawX -Y $barcodeDrawY -Width $barcodeDrawWidth -Height $barcodeDrawHeight -Brush $black
-        $barcodeTextY = [int]($y + $obcY + $barcodeDrawHeight + 2)
-        $barcodeTextRect = New-Object System.Drawing.RectangleF($barcodeDrawX, $barcodeTextY, $barcodeDrawWidth, 12)
-        $barcodeFormat = New-Object System.Drawing.StringFormat
-        $barcodeFormat.Alignment = [System.Drawing.StringAlignment]::Center
-        $g.DrawString($barcode, $barcodeFontScaled, $black, $barcodeTextRect, $barcodeFormat)
+        if (Test-DisplayField -Payload $payload -Field "barcode") {
+            Draw-Code128B -Graphics $g -Text $barcode -X $barcodeDrawX -Y $barcodeDrawY -Width $barcodeDrawWidth -Height $barcodeDrawHeight -Brush $black
+            $barcodeTextY = [int]($y + $obcY + $barcodeDrawHeight + 2)
+            $barcodeTextRect = New-Object System.Drawing.RectangleF($barcodeDrawX, $barcodeTextY, $barcodeDrawWidth, 12)
+            $barcodeFormat = New-Object System.Drawing.StringFormat
+            $barcodeFormat.Alignment = [System.Drawing.StringAlignment]::Center
+            $g.DrawString($barcode, $barcodeFontScaled, $black, $barcodeTextRect, $barcodeFormat)
+        }
 
         $y += 52
         $colW = [Math]::Floor($contentWidth / 3)
         $detailsX = [int]($x + $odtX)
         $detailsY = [int]($y + $odtY)
-        $g.DrawString("QTY $quantity", $detailsFont, $black, $detailsX, $detailsY)
-        $g.DrawString("TYPE $itemType", $detailsFont, $black, [int]($detailsX + $colW), $detailsY)
-        $g.DrawString("WT $weight", $detailsFont, $black, [int]($detailsX + ($colW * 2)), $detailsY)
+        if (Test-DisplayField -Payload $payload -Field "quantity") { $g.DrawString("QTY $quantity", $detailsFont, $black, $detailsX, $detailsY) }
+        if (Test-DisplayField -Payload $payload -Field "item_type") { $g.DrawString("TYPE $itemType", $detailsFont, $black, [int]($detailsX + $colW), $detailsY) }
+        if (Test-DisplayField -Payload $payload -Field "weight") { $g.DrawString("WT $weight", $detailsFont, $black, [int]($detailsX + ($colW * 2)), $detailsY) }
         $y += 12
 
-        if ($notes.Length -gt 0) {
+        if ((Test-DisplayField -Payload $payload -Field "notes") -and $notes.Length -gt 0) {
             $notesX = [int]($x + $ontX); $notesY = [int]($y + $ontY)
             $rect = New-Object System.Drawing.RectangleF($notesX, $notesY, $contentWidth, 26)
             $g.DrawString("Notes: $notes", $notesFont, $black, $rect)
+        }
+
+        if ($payload.PSObject.Properties['show_qr'] -and $payload.show_qr) {
+            $qrSize = 46
+            $cell = 4
+            $qrX = [Math]::Max(2, $pageWidth - $qrSize - 8)
+            $qrY = [Math]::Max(2, $e.PageBounds.Height - $qrSize - 8)
+            $g.FillRectangle([System.Drawing.Brushes]::White, $qrX, $qrY, $qrSize, $qrSize)
+            $g.DrawRectangle([System.Drawing.Pens]::Black, $qrX, $qrY, $qrSize, $qrSize)
+            $source = "$barcode|$productName"
+            if ([string]::IsNullOrWhiteSpace($source)) { $source = "LABEL" }
+            for ($row = 0; $row -lt 11; $row++) {
+                for ($col = 0; $col -lt 11; $col++) {
+                    $index = ($row * 11) + $col
+                    $code = [int][char]$source[$index % $source.Length]
+                    if ((($code + ($index * 7) + ($row * 13)) % 5) -lt 2) {
+                        $g.FillRectangle($black, $qrX + 2 + ($col * $cell), $qrY + 2 + ($row * $cell), $cell, $cell)
+                    }
+                }
+            }
         }
 
         $e.HasMorePages = $false

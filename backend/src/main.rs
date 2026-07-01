@@ -41,6 +41,10 @@ struct LabelRequest {
     layout_preset: String,
     #[serde(default = "default_barcode_width_pct")]
     barcode_width_pct: u8,
+    #[serde(default = "default_barcode_height_pct")]
+    barcode_height_pct: u8,
+    #[serde(default)]
+    show_qr: bool,
     #[serde(default)]
     driver_media_name: Option<String>,
     #[serde(default = "default_printer_profile")]
@@ -49,6 +53,10 @@ struct LabelRequest {
     zpl_dpi: u16,
     #[serde(default = "default_print_orientation")]
     print_orientation: String,
+    #[serde(default)]
+    display_options: serde_json::Value,
+    #[serde(default)]
+    font_settings: serde_json::Value,
     #[serde(default)]
     layout_offsets: serde_json::Value,
 }
@@ -70,6 +78,10 @@ fn default_layout_preset() -> String {
 }
 
 fn default_barcode_width_pct() -> u8 {
+    42
+}
+
+fn default_barcode_height_pct() -> u8 {
     42
 }
 
@@ -477,10 +489,14 @@ async fn create_label(Json(payload): Json<LabelRequest>) -> Json<serde_json::Val
             "label_length_mm": payload.label_length_mm,
             "layout_preset": payload.layout_preset,
             "barcode_width_pct": payload.barcode_width_pct,
+            "barcode_height_pct": payload.barcode_height_pct,
+            "show_qr": payload.show_qr,
             "driver_media_name": payload.driver_media_name,
             "printer_profile": payload.printer_profile,
             "zpl_dpi": payload.zpl_dpi,
             "print_orientation": payload.print_orientation,
+            "display_options": payload.display_options,
+            "font_settings": payload.font_settings,
             "layout_offsets": payload.layout_offsets
         }
     }))

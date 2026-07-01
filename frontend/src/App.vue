@@ -9,6 +9,23 @@ type LayoutOffset = {
   scale: number
 }
 
+type FontSetting = {
+  family: string
+  size: number
+  bold: boolean
+  italic: boolean
+}
+
+type DisplayOptions = {
+  product_number: boolean
+  product_name: boolean
+  barcode: boolean
+  quantity: boolean
+  item_type: boolean
+  weight: boolean
+  notes: boolean
+}
+
 type LabelPayload = {
   product_number: string
   product_name: string
@@ -24,10 +41,14 @@ type LabelPayload = {
   label_length_mm: number
   layout_preset: string
   barcode_width_pct: number
+  barcode_height_pct: number
+  show_qr: boolean
   driver_media_name: string
   printer_profile: string
   zpl_dpi: number
   print_orientation: 'horizontal' | 'vertical'
+  display_options: DisplayOptions
+  font_settings: Record<LayoutFieldKey, FontSetting>
   layout_offsets: Record<LayoutFieldKey, LayoutOffset>
 }
 
@@ -82,10 +103,28 @@ const form = reactive<LabelPayload>({
   label_length_mm: 60,
   layout_preset: 'compact_right',
   barcode_width_pct: 42,
+  barcode_height_pct: 42,
+  show_qr: false,
   driver_media_name: '62mm',
   printer_profile: 'brother_ql_windows',
   zpl_dpi: 203,
   print_orientation: 'horizontal',
+  display_options: {
+    product_number: true,
+    product_name: true,
+    barcode: true,
+    quantity: true,
+    item_type: true,
+    weight: true,
+    notes: true,
+  },
+  font_settings: {
+    product_number: { family: 'Arial', size: 27, bold: true, italic: false },
+    product_name: { family: 'Arial', size: 14, bold: true, italic: false },
+    barcode: { family: 'Consolas', size: 8, bold: true, italic: false },
+    details: { family: 'Arial', size: 9, bold: false, italic: false },
+    notes: { family: 'Arial', size: 9, bold: false, italic: false },
+  },
   layout_offsets: {
     product_number: { x: 0, y: 0, scale: 1 },
     product_name: { x: 0, y: 0, scale: 1 },
@@ -112,8 +151,11 @@ const newTemplatesCount = ref(0)
 const driverLoading = ref(false)
 const printCopies = ref(1)
 const printedCount = ref(0)
+const snapToGrid = ref(true)
+const gridSize = ref(5)
 const selectedLayoutField = ref<LayoutFieldKey>('barcode')
 const dragState = ref<{ field: LayoutFieldKey; startX: number; startY: number; originX: number; originY: number } | null>(null)
+const fontFamilies = ['Arial', 'Helvetica', 'Times New Roman', 'sans-serif', 'serif', 'monospace', 'Consolas', 'Courier New', 'Verdana', 'Tahoma', 'Trebuchet MS', 'Georgia']
 const layoutFields: Array<{ key: LayoutFieldKey; label: string }> = [
   { key: 'product_number', label: 'Product Number' },
   { key: 'product_name', label: 'Product Name' },
@@ -133,8 +175,9 @@ const statusLabel = computed(() => printerOnline.value ? 'ONLINE' : 'OFFLINE')
 const statusClass = computed(() => printerOnline.value ? 'online' : 'offline')
 const printerProfiles = [
   { id: 'brother_ql_windows', name: 'Brother QL via Windows Driver', status: 'Active', note: 'Current stable path for QL-820NWB and other Brother QL printers installed in Windows.' },
-  { id: 'generic_windows', name: 'Generic Windows Printer', status: 'Active', note: 'Fallback path for installed Windows printers using standard driver printing and selected media.' },
   { id: 'zebra_zpl', name: 'Zebra ZPL', status: 'Active', note: 'Direct ZPL output for Zebra GK/ZD/ZT/LP/TLP label printers through a Windows RAW printer queue.' },
+  { id: 'epson_windows', name: 'Epson Label via Windows Driver', status: 'Active', note: 'Preset for Epson/Seiko label printers installed as normal Windows queues.' },
+  { id: 'generic_windows', name: 'Generic Windows Printer', status: 'Active', note: 'Fallback path for installed Windows printers using standard driver printing and selected media.' },
 ]
 const selectedProfile = computed(() => printerProfiles.find((profile) => profile.id === form.printer_profile) || printerProfiles[0])
 const selectedMedia = computed(() => `${form.label_width_mm}mm x ${form.label_length_mm}mm`)
@@ -171,16 +214,39 @@ const labelTapeStyle = computed(() => {
 
 function fieldStyle(field: LayoutFieldKey) {
   const offset = form.layout_offsets[field]
+  const font = form.font_settings?.[field]
   return {
     transform: `translate(${offset.x}px, ${offset.y}px) scale(${offset.scale})`,
     transformOrigin: 'top left',
+    fontFamily: font?.family || undefined,
+    fontSize: font?.size ? `${font.size}px` : undefined,
+    fontWeight: font?.bold ? '900' : undefined,
+    fontStyle: font?.italic ? 'italic' : undefined,
   }
+}
+
+const barcodeStyle = computed(() => ({
+  height: `${Math.min(120, Math.max(28, form.barcode_height_pct * 1.5))}px`,
+}))
+
+const qrCells = computed(() => {
+  const source = `${form.barcode || form.product_number || 'LABEL'}|${form.product_name}`
+  return Array.from({ length: 121 }, (_, index) => {
+    const charCode = source.charCodeAt(index % source.length) || 31
+    return ((charCode + index * 7 + Math.floor(index / 11) * 13) % 5) < 2
+  })
+})
+
+function snapValue(value: number) {
+  if (!snapToGrid.value) return value
+  const size = Math.min(25, Math.max(1, Number(gridSize.value) || 5))
+  return Math.round(value / size) * size
 }
 
 function nudgeField(dx: number, dy: number) {
   const field = form.layout_offsets[selectedLayoutField.value]
-  field.x += dx
-  field.y += dy
+  field.x = snapValue(field.x + dx)
+  field.y = snapValue(field.y + dy)
 }
 
 function scaleField(delta: number) {
@@ -199,8 +265,8 @@ function startDrag(field: LayoutFieldKey, event: PointerEvent) {
 function dragField(event: PointerEvent) {
   if (!dragState.value) return
   const offset = form.layout_offsets[dragState.value.field]
-  offset.x = dragState.value.originX + event.clientX - dragState.value.startX
-  offset.y = dragState.value.originY + event.clientY - dragState.value.startY
+  offset.x = snapValue(dragState.value.originX + event.clientX - dragState.value.startX)
+  offset.y = snapValue(dragState.value.originY + event.clientY - dragState.value.startY)
 }
 
 function stopDrag() {
@@ -223,13 +289,25 @@ function resetLayoutOffsets() {
   }
 }
 
-function ensureLayoutOffsets() {
+function ensureLayoutOptions() {
   if (!form.layout_offsets) form.layout_offsets = {} as Record<LayoutFieldKey, LayoutOffset>
+  if (!form.font_settings) form.font_settings = {} as Record<LayoutFieldKey, FontSetting>
+  if (!form.display_options) {
+    form.display_options = { product_number: true, product_name: true, barcode: true, quantity: true, item_type: true, weight: true, notes: true }
+  }
   for (const field of layoutFields) {
     if (!form.layout_offsets[field.key]) {
       form.layout_offsets[field.key] = { x: 0, y: 0, scale: 1 }
     }
+    if (!form.font_settings[field.key]) {
+      form.font_settings[field.key] = { family: field.key === 'barcode' ? 'Consolas' : 'Arial', size: field.key === 'product_number' ? 27 : 9, bold: field.key === 'product_number' || field.key === 'product_name' || field.key === 'barcode', italic: false }
+    }
   }
+  if (!form.barcode_height_pct) form.barcode_height_pct = 42
+}
+
+function ensureLayoutOffsets() {
+  ensureLayoutOptions()
 }
 
 const code128Patterns = [
@@ -674,7 +752,46 @@ onUnmounted(() => {
                   <option v-for="field in layoutFields" :key="field.key" :value="field.key">{{ field.label }}</option>
                 </select>
               </label>
-              <div class="nudge-pad">
+              <label>
+                Font
+                <select v-model="form.font_settings[selectedLayoutField].family">
+                  <option v-for="font in fontFamilies" :key="font" :value="font">{{ font }}</option>
+                </select>
+              </label>
+              <label>
+                Font Size
+                <input v-model.number="form.font_settings[selectedLayoutField].size" min="6" max="48" type="number" />
+              </label>
+              <label class="check-row">
+                <input v-model="form.font_settings[selectedLayoutField].bold" type="checkbox" /> Bold
+              </label>
+              <label class="check-row">
+                <input v-model="form.font_settings[selectedLayoutField].italic" type="checkbox" /> Italic
+              </label>
+              <label>
+                Barcode Height
+                <input v-model.number="form.barcode_height_pct" min="20" max="80" type="range" />
+              </label>
+              <label>
+                Snap Grid px
+                <input v-model.number="gridSize" min="1" max="25" type="number" />
+              </label>
+              <label class="check-row">
+                <input v-model="snapToGrid" type="checkbox" /> Snap to grid
+              </label>
+              <label class="check-row">
+                <input v-model="form.show_qr" type="checkbox" /> Show QR code
+              </label>
+              <div class="optional-fields full">
+                <label><input v-model="form.display_options.product_number" type="checkbox" /> SKU</label>
+                <label><input v-model="form.display_options.product_name" type="checkbox" /> Name</label>
+                <label><input v-model="form.display_options.barcode" type="checkbox" /> Barcode</label>
+                <label><input v-model="form.display_options.quantity" type="checkbox" /> Quantity</label>
+                <label><input v-model="form.display_options.item_type" type="checkbox" /> Item Type</label>
+                <label><input v-model="form.display_options.weight" type="checkbox" /> Weight</label>
+                <label><input v-model="form.display_options.notes" type="checkbox" /> Notes</label>
+              </div>
+              <div class="nudge-pad full">
                 <button class="ghost" type="button" @click="nudgeField(0, -2)">UP</button>
                 <button class="ghost" type="button" @click="nudgeField(-2, 0)">LEFT</button>
                 <button class="ghost" type="button" @click="nudgeField(2, 0)">RIGHT</button>
@@ -730,32 +847,32 @@ onUnmounted(() => {
             <div class="tape-meta top">Brother QL / {{ form.driver_media_name || selectedMedia }} / {{ form.print_orientation }} / Code128</div>
             <div class="label-left">
               <div>
-                <div class="sku draggable-field" :class="{ selected: selectedLayoutField === 'product_number' }" :style="fieldStyle('product_number')" @pointerdown.stop.prevent="startDrag('product_number', $event)">{{ form.product_number || 'SKU-000' }}</div>
-                <div class="product draggable-field" :class="{ selected: selectedLayoutField === 'product_name' }" :style="fieldStyle('product_name')" @pointerdown.stop.prevent="startDrag('product_name', $event)">{{ form.product_name || 'Product name' }}</div>
+                <div v-if="form.display_options.product_number" class="sku draggable-field" :class="{ selected: selectedLayoutField === 'product_number' }" :style="fieldStyle('product_number')" @pointerdown.stop.prevent="startDrag('product_number', $event)">{{ form.product_number || 'SKU-000' }}</div>
+                <div v-if="form.display_options.product_name" class="product draggable-field" :class="{ selected: selectedLayoutField === 'product_name' }" :style="fieldStyle('product_name')" @pointerdown.stop.prevent="startDrag('product_name', $event)">{{ form.product_name || 'Product name' }}</div>
               </div>
 
               <div class="label-data draggable-field" :class="{ selected: selectedLayoutField === 'details' }" :style="fieldStyle('details')" @pointerdown.stop.prevent="startDrag('details', $event)">
-                <div>
+                <div v-if="form.display_options.item_type">
                   <span>ITEM TYPE</span>
                   <strong>{{ form.item_type || 'TYPE' }}</strong>
                 </div>
-                <div>
+                <div v-if="form.display_options.weight">
                   <span>WEIGHT</span>
                   <strong>{{ form.weight || '0 KG' }}</strong>
                 </div>
-                <div>
+                <div v-if="form.display_options.quantity">
                   <span>QTY</span>
                   <strong>{{ form.quantity }}</strong>
                 </div>
-                <div>
+                <div v-if="form.display_options.notes">
                   <span>NOTES</span>
                   <strong class="draggable-field" :class="{ selected: selectedLayoutField === 'notes' }" :style="fieldStyle('notes')" @pointerdown.stop.prevent="startDrag('notes', $event)">{{ form.notes || 'NONE' }}</strong>
                 </div>
               </div>
             </div>
 
-            <div class="barcode-box draggable-field" :class="{ selected: selectedLayoutField === 'barcode' }" :style="fieldStyle('barcode')" @pointerdown.stop.prevent="startDrag('barcode', $event)">
-              <div class="barcode">
+            <div v-if="form.display_options.barcode" class="barcode-box draggable-field" :class="{ selected: selectedLayoutField === 'barcode' }" :style="fieldStyle('barcode')" @pointerdown.stop.prevent="startDrag('barcode', $event)">
+              <div class="barcode" :style="barcodeStyle">
                 <i
                   v-for="(bar, index) in barcodeBars"
                   :key="index"
@@ -763,6 +880,10 @@ onUnmounted(() => {
                 ></i>
               </div>
               <div class="barcode-text">{{ form.barcode || '123456789012' }}</div>
+            </div>
+
+            <div v-if="form.show_qr" class="qr-code" title="QR preview">
+              <i v-for="(filled, index) in qrCells" :key="index" :class="{ filled }"></i>
             </div>
           </div>
         </div>
