@@ -59,6 +59,8 @@ struct LabelRequest {
     font_settings: serde_json::Value,
     #[serde(default)]
     layout_offsets: serde_json::Value,
+    #[serde(default)]
+    preview_image_data_url: Option<String>,
 }
 
 fn default_zpl_dpi() -> u16 {
@@ -497,7 +499,8 @@ async fn create_label(Json(payload): Json<LabelRequest>) -> Json<serde_json::Val
             "print_orientation": payload.print_orientation,
             "display_options": payload.display_options,
             "font_settings": payload.font_settings,
-            "layout_offsets": payload.layout_offsets
+            "layout_offsets": payload.layout_offsets,
+            "preview_image_data_url": payload.preview_image_data_url
         }
     }))
 }

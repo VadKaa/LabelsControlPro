@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 
-type LayoutFieldKey = 'product_number' | 'product_name' | 'barcode' | 'details' | 'notes'
+type LayoutFieldKey = 'product_number' | 'product_name' | 'barcode' | 'qr_code' | 'details' | 'notes'
 
 type LayoutOffset = {
   x: number
@@ -50,6 +50,7 @@ type LabelPayload = {
   display_options: DisplayOptions
   font_settings: Record<LayoutFieldKey, FontSetting>
   layout_offsets: Record<LayoutFieldKey, LayoutOffset>
+  preview_image_data_url?: string
 }
 
 type Printer = {
@@ -122,6 +123,7 @@ const form = reactive<LabelPayload>({
     product_number: { family: 'Arial', size: 27, bold: true, italic: false },
     product_name: { family: 'Arial', size: 14, bold: true, italic: false },
     barcode: { family: 'Consolas', size: 8, bold: true, italic: false },
+    qr_code: { family: 'Arial', size: 9, bold: false, italic: false },
     details: { family: 'Arial', size: 9, bold: false, italic: false },
     notes: { family: 'Arial', size: 9, bold: false, italic: false },
   },
@@ -129,6 +131,7 @@ const form = reactive<LabelPayload>({
     product_number: { x: 0, y: 0, scale: 1 },
     product_name: { x: 0, y: 0, scale: 1 },
     barcode: { x: 0, y: 0, scale: 1 },
+    qr_code: { x: 0, y: 0, scale: 1 },
     details: { x: 0, y: 0, scale: 1 },
     notes: { x: 0, y: 0, scale: 1 },
   },
@@ -160,6 +163,7 @@ const layoutFields: Array<{ key: LayoutFieldKey; label: string }> = [
   { key: 'product_number', label: 'Product Number' },
   { key: 'product_name', label: 'Product Name' },
   { key: 'barcode', label: 'Barcode' },
+  { key: 'qr_code', label: 'QR Code' },
   { key: 'details', label: 'Qty / Type / Weight' },
   { key: 'notes', label: 'Notes' },
 ]
@@ -201,14 +205,42 @@ const filteredTemplates = computed(() => {
   })
 })
 const previewKey = computed(() => `${form.label_width_mm}-${form.label_length_mm}-${form.layout_preset}-${form.print_orientation}-${form.product_number}-${form.product_name}-${form.barcode}`)
+const barcodeHeightPx = computed(() => Math.min(120, Math.max(28, Number(form.barcode_height_pct || 42) * 1.5)))
+const previewSize = computed(() => {
+  const isVertical = form.print_orientation === 'vertical'
+  const physicalWidthMm = isVertical ? form.label_width_mm : form.label_length_mm
+  const physicalHeightMm = isVertical ? form.label_length_mm : form.label_width_mm
+  const scale = Math.min(9, 900 / Math.max(1, physicalWidthMm), 520 / Math.max(1, physicalHeightMm))
+  return {
+    width: Math.max(180, physicalWidthMm * scale),
+    height: Math.max(120, physicalHeightMm * scale),
+  }
+})
+const brotherPrintableWidthMm = 58.93
+const printableSafeStyle = computed(() => {
+  if (form.printer_profile !== 'brother_ql_windows' || form.label_width_mm > 62) return {}
+  const safeHeightPct = Math.min(100, (brotherPrintableWidthMm / Math.max(1, form.label_width_mm)) * 100)
+  const insetPct = Math.max(0, (100 - safeHeightPct) / 2)
+  return {
+    top: `${insetPct}%`,
+    bottom: `${insetPct}%`,
+  }
+})
+const previewScale = computed(() => {
+  const isVertical = form.print_orientation === 'vertical'
+  return {
+    x: previewSize.value.width / Math.max(1, isVertical ? form.label_width_mm : form.label_length_mm),
+    y: previewSize.value.height / Math.max(1, isVertical ? form.label_length_mm : form.label_width_mm),
+  }
+})
 const labelTapeStyle = computed(() => {
   const isVertical = form.print_orientation === 'vertical'
-  const width = isVertical ? Math.min(420, Math.max(210, form.label_width_mm * 4.2)) : Math.min(900, Math.max(320, form.label_length_mm * 9))
-  const height = isVertical ? Math.min(900, Math.max(320, form.label_length_mm * 5.5)) : Math.min(320, Math.max(145, form.label_width_mm * 2.35))
   return {
-    width: `${width}px`,
-    minHeight: `${height}px`,
+    width: `${previewSize.value.width}px`,
+    height: `${previewSize.value.height}px`,
+    minHeight: `${previewSize.value.height}px`,
     gridTemplateColumns: isVertical || ['stacked', 'barcode_bottom', 'minimal'].includes(form.layout_preset) ? '1fr' : 'minmax(0, 58fr) 42fr',
+    '--barcode-height': `${barcodeHeightPx.value}px`,
   }
 })
 
@@ -216,7 +248,7 @@ function fieldStyle(field: LayoutFieldKey) {
   const offset = form.layout_offsets[field]
   const font = form.font_settings?.[field]
   return {
-    transform: `translate(${offset.x}px, ${offset.y}px) scale(${offset.scale})`,
+    transform: `translate(${offset.x * previewScale.value.x}px, ${offset.y * previewScale.value.y}px) scale(${offset.scale})`,
     transformOrigin: 'top left',
     fontFamily: font?.family || undefined,
     fontSize: font?.size ? `${font.size}px` : undefined,
@@ -226,7 +258,7 @@ function fieldStyle(field: LayoutFieldKey) {
 }
 
 const barcodeStyle = computed(() => ({
-  height: `${Math.min(120, Math.max(28, form.barcode_height_pct * 1.5))}px`,
+  height: `${barcodeHeightPx.value}px`,
 }))
 
 const qrCells = computed(() => {
@@ -239,14 +271,14 @@ const qrCells = computed(() => {
 
 function snapValue(value: number) {
   if (!snapToGrid.value) return value
-  const size = Math.min(25, Math.max(1, Number(gridSize.value) || 5))
-  return Math.round(value / size) * size
+  const size = Math.min(25, Math.max(1, Number(gridSize.value) || 5)) / 10
+  return Number((Math.round(value / size) * size).toFixed(2))
 }
 
 function nudgeField(dx: number, dy: number) {
   const field = form.layout_offsets[selectedLayoutField.value]
-  field.x = snapValue(field.x + dx)
-  field.y = snapValue(field.y + dy)
+  field.x = snapValue(field.x + dx / 2)
+  field.y = snapValue(field.y + dy / 2)
 }
 
 function scaleField(delta: number) {
@@ -265,8 +297,8 @@ function startDrag(field: LayoutFieldKey, event: PointerEvent) {
 function dragField(event: PointerEvent) {
   if (!dragState.value) return
   const offset = form.layout_offsets[dragState.value.field]
-  offset.x = snapValue(dragState.value.originX + event.clientX - dragState.value.startX)
-  offset.y = snapValue(dragState.value.originY + event.clientY - dragState.value.startY)
+  offset.x = snapValue(dragState.value.originX + ((event.clientX - dragState.value.startX) / previewScale.value.x))
+  offset.y = snapValue(dragState.value.originY + ((event.clientY - dragState.value.startY) / previewScale.value.y))
 }
 
 function stopDrag() {
@@ -544,6 +576,52 @@ async function runDriverAction(action: 'install' | 'uninstall') {
   }
 }
 
+async function generatePreviewImageDataUrl() {
+  const label = document.querySelector('.label-tape') as HTMLElement | null
+  if (!label) return ''
+
+  const rect = label.getBoundingClientRect()
+  const clone = label.cloneNode(true) as HTMLElement
+  clone.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml')
+  clone.querySelectorAll('.printable-safe-area, .tape-meta').forEach((element) => element.remove())
+  clone.querySelectorAll('.selected').forEach((element) => element.classList.remove('selected'))
+  clone.style.width = `${rect.width}px`
+  clone.style.height = `${rect.height}px`
+  clone.style.minHeight = `${rect.height}px`
+  clone.style.margin = '0'
+  clone.style.boxSizing = 'border-box'
+
+  let css = ''
+  for (const sheet of Array.from(document.styleSheets)) {
+    try {
+      css += Array.from(sheet.cssRules).map((rule) => rule.cssText).join('\n')
+    } catch {
+      // Ignore cross-origin stylesheets; computed layout still remains in the cloned markup.
+    }
+  }
+
+  const html = `<style>${css}</style>${clone.outerHTML}`
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${rect.width}" height="${rect.height}"><foreignObject width="100%" height="100%">${html}</foreignObject></svg>`
+  const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+
+  return await new Promise<string>((resolve) => {
+    const image = new Image()
+    image.onload = () => {
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.round(rect.width * 2))
+      canvas.height = Math.max(1, Math.round(rect.height * 2))
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return resolve('')
+      ctx.fillStyle = '#ffffff'
+      ctx.fillRect(0, 0, canvas.width, canvas.height)
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
+      resolve(canvas.toDataURL('image/png'))
+    }
+    image.onerror = () => resolve('')
+    image.src = svgUrl
+  })
+}
+
 async function submitLabel() {
   loading.value = true
   error.value = ''
@@ -553,9 +631,10 @@ async function submitLabel() {
 
   try {
     const totalCopies = normalizedPrintCopies.value
+    const previewImageDataUrl = await generatePreviewImageDataUrl()
 
     for (let copy = 1; copy <= totalCopies; copy += 1) {
-      const payload = { ...form, print: true }
+      const payload = { ...form, print: true, preview_image_data_url: previewImageDataUrl }
       const res = await fetch(`${API_BASE}/label`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -769,8 +848,8 @@ onUnmounted(() => {
                 <input v-model="form.font_settings[selectedLayoutField].italic" type="checkbox" /> Italic
               </label>
               <label>
-                Barcode Height
-                <input v-model.number="form.barcode_height_pct" min="20" max="80" type="range" />
+                Barcode Height: {{ form.barcode_height_pct }}%
+                <input v-model.number="form.barcode_height_pct" min="20" max="80" step="1" type="range" />
               </label>
               <label>
                 Snap Grid px
@@ -845,6 +924,7 @@ onUnmounted(() => {
         <div class="canvas-grid">
           <div :key="previewKey" class="label-tape" :class="[form.layout_preset, form.print_orientation]" :style="labelTapeStyle">
             <div class="tape-meta top">Brother QL / {{ form.driver_media_name || selectedMedia }} / {{ form.print_orientation }} / Code128</div>
+            <div v-if="form.printer_profile === 'brother_ql_windows'" class="printable-safe-area" :style="printableSafeStyle"></div>
             <div class="label-left">
               <div>
                 <div v-if="form.display_options.product_number" class="sku draggable-field" :class="{ selected: selectedLayoutField === 'product_number' }" :style="fieldStyle('product_number')" @pointerdown.stop.prevent="startDrag('product_number', $event)">{{ form.product_number || 'SKU-000' }}</div>
@@ -882,7 +962,7 @@ onUnmounted(() => {
               <div class="barcode-text">{{ form.barcode || '123456789012' }}</div>
             </div>
 
-            <div v-if="form.show_qr" class="qr-code" title="QR preview">
+            <div v-if="form.show_qr" class="qr-code draggable-field" :class="{ selected: selectedLayoutField === 'qr_code' }" :style="fieldStyle('qr_code')" title="QR preview" @pointerdown.stop.prevent="startDrag('qr_code', $event)">
               <i v-for="(filled, index) in qrCells" :key="index" :class="{ filled }"></i>
             </div>
           </div>

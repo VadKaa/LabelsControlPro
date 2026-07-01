@@ -86,11 +86,28 @@ function Test-DisplayField {
     return [bool]$fieldProp.Value
 }
 
+function Get-DetailsText {
+    param($Payload, [string]$Quantity, [string]$ItemType, [string]$Weight)
+    $parts = @()
+    if (Test-DisplayField -Payload $Payload -Field "quantity") { $parts += "QTY $Quantity" }
+    if (Test-DisplayField -Payload $Payload -Field "item_type") { $parts += "TYPE $ItemType" }
+    if (Test-DisplayField -Payload $Payload -Field "weight") { $parts += "WT $Weight" }
+    return ($parts -join "  |  ")
+}
+
 function Get-FieldFont {
     param($Payload, [string]$Field, [string]$DefaultFamily, [float]$DefaultSize, $Style)
     $allowedFamilies = @("Arial", "Helvetica", "Times New Roman", "sans-serif", "serif", "monospace", "Consolas", "Courier New", "Verdana", "Tahoma", "Trebuchet MS", "Georgia")
     $family = $DefaultFamily
     $size = $DefaultSize
+    $previewDefaultSize = switch ($Field) {
+        "product_number" { 27.0 }
+        "product_name" { 14.0 }
+        "barcode" { 8.0 }
+        "details" { 9.0 }
+        "notes" { 9.0 }
+        default { 9.0 }
+    }
     $bold = (($Style -band [System.Drawing.FontStyle]::Bold) -eq [System.Drawing.FontStyle]::Bold)
     $italic = (($Style -band [System.Drawing.FontStyle]::Italic) -eq [System.Drawing.FontStyle]::Italic)
     $fontProp = $Payload.PSObject.Properties['font_settings']
@@ -98,7 +115,7 @@ function Get-FieldFont {
         $fieldProp = $fontProp.Value.PSObject.Properties[$Field]
         if ($null -ne $fieldProp) {
             if ($fieldProp.Value.PSObject.Properties['family'] -and $fieldProp.Value.family) { $family = $fieldProp.Value.family.ToString() }
-            if ($fieldProp.Value.PSObject.Properties['size'] -and $fieldProp.Value.size) { $size = [float]$fieldProp.Value.size }
+            if ($fieldProp.Value.PSObject.Properties['size'] -and $fieldProp.Value.size) { $size = [float]($DefaultSize * ([float]$fieldProp.Value.size / $previewDefaultSize)) }
             if ($fieldProp.Value.PSObject.Properties['bold']) { $bold = [bool]$fieldProp.Value.bold }
             if ($fieldProp.Value.PSObject.Properties['italic']) { $italic = [bool]$fieldProp.Value.italic }
         }
@@ -108,7 +125,7 @@ function Get-FieldFont {
     if ($family -eq "serif") { $family = "Times New Roman" }
     if ($family -eq "monospace") { $family = "Consolas" }
     if ($size -lt 5) { $size = 5 }
-    if ($size -gt 36) { $size = 36 }
+    if ($size -gt 18) { $size = 18 }
     $fontStyle = [System.Drawing.FontStyle]::Regular
     if ($bold) { $fontStyle = $fontStyle -bor [System.Drawing.FontStyle]::Bold }
     if ($italic) { $fontStyle = $fontStyle -bor [System.Drawing.FontStyle]::Italic }
@@ -212,7 +229,12 @@ try {
         if (Test-DisplayField -Payload $payload -Field "product_number") { $zpl += "^FO20,18^A0$zplOrient,30,30^FD$productNumber^FS`n" }
         if (Test-DisplayField -Payload $payload -Field "product_name") { $zpl += "^FO20,52^A0$zplOrient,24,24^FB$($labelWidthDots - 40),2,0,L,0^FD$productName^FS`n" }
         if (Test-DisplayField -Payload $payload -Field "barcode") { $zpl += "^FO20,105^BY2,2,$barcodeHeight^BC$zplOrient,$barcodeHeight,Y,N,N^FD$safeBarcode^FS`n" }
-        if ($payload.PSObject.Properties['show_qr'] -and $payload.show_qr) { $zpl += "^FO$($labelWidthDots - 145),20^BQN,2,4^FDLA,$safeBarcode^FS`n" }
+        if ($payload.PSObject.Properties['show_qr'] -and $payload.show_qr) {
+            $offQr = Get-LayoutOffset -Payload $payload -Field "qr_code"
+            $qrX = [int](($labelWidthDots - 145) + $offQr.x)
+            $qrY = [int](20 + $offQr.y)
+            $zpl += "^FO$qrX,$qrY^BQN,2,4^FDLA,$safeBarcode^FS`n"
+        }
         $details = @()
         if (Test-DisplayField -Payload $payload -Field "quantity") { $details += "QTY $quantity" }
         if (Test-DisplayField -Payload $payload -Field "item_type") { $details += "TYPE $itemType" }
@@ -243,11 +265,20 @@ try {
     }
 
     # Prefer the exact driver media selected in the interface.
-    # For Brother DK continuous tape, media is "62mm" and cut/design length is controlled by page height.
+    # Brother QL drivers validate the installed roll against the selected PaperSize RawKind.
+    # For Brother continuous tape, use the driver's own "62mm" paper size object exactly;
+    # do not create a custom "62mm x 60mm" PaperSize or the driver can report a roll mismatch.
     if (-not [string]::IsNullOrWhiteSpace($driverMediaName)) {
         foreach ($size in $settings.PaperSizes) {
             if ($size.PaperName -eq $driverMediaName) {
-                if ($driverMediaName -match '^\d+mm$') {
+                if ($printerProfile -eq "brother_ql_windows") {
+                    # Brother QL continuous tape length must come from the app label_length_mm,
+                    # not from the static length currently selected in Windows Printing Preferences.
+                    # Keep the driver's media identity/RawKind so the 62mm roll is accepted, but
+                    # override the paper height to the requested cut length.
+                    $paperSize = New-Object System.Drawing.Printing.PaperSize($size.PaperName, $labelWidthHi, $labelLengthHi)
+                    try { $paperSize.RawKind = $size.RawKind } catch { }
+                } elseif ($driverMediaName -match '^\d+mm$') {
                     $paperSize = New-Object System.Drawing.Printing.PaperSize($size.PaperName, $labelWidthHi, $labelLengthHi)
                     try { $paperSize.RawKind = $size.RawKind } catch { }
                 } else {
@@ -262,21 +293,88 @@ try {
         foreach ($size in $settings.PaperSizes) {
             $widthMatches = [Math]::Abs($size.Width - $labelWidthHi) -le 2
             $lengthMatches = [Math]::Abs($size.Height - $labelLengthHi) -le 4
-            if ($widthMatches -and $lengthMatches) {
-                $paperSize = $size
+            if (($printerProfile -eq "brother_ql_windows" -and $widthMatches) -or ($widthMatches -and $lengthMatches)) {
+                if ($printerProfile -eq "brother_ql_windows") {
+                    $paperSize = New-Object System.Drawing.Printing.PaperSize($size.PaperName, $labelWidthHi, $labelLengthHi)
+                    try { $paperSize.RawKind = $size.RawKind } catch { }
+                } else {
+                    $paperSize = $size
+                }
                 break
             }
         }
     }
 
     if ($null -eq $paperSize) {
-        $paperName = if ($printerProfile -eq "brother_ql_windows") { "${LabelWidthMm}mm continuous" } else { "${LabelWidthMm}mm x ${LabelLengthMm}mm" }
+        if ($printerProfile -eq "brother_ql_windows") {
+            throw "Brother media '$driverMediaName' was not found in the Windows driver. Select the exact installed roll media, e.g. 62mm, not 62mm x 60mm."
+        }
+        $paperName = "${LabelWidthMm}mm x ${LabelLengthMm}mm"
         $paperSize = New-Object System.Drawing.Printing.PaperSize($paperName, $labelWidthHi, $labelLengthHi)
     }
 
     $doc.DefaultPageSettings.PaperSize = $paperSize
-    $doc.DefaultPageSettings.Landscape = ($printOrientation -eq "horizontal")
+    # Brother QL continuous media is most reliable when the Windows driver stays in landscape.
+    # Vertical is handled by layout/field coordinates, not by flipping the driver page orientation.
+    if ($printerProfile -eq "brother_ql_windows") {
+        $doc.DefaultPageSettings.Landscape = $true
+    } else {
+        $doc.DefaultPageSettings.Landscape = ($printOrientation -eq "horizontal")
+    }
     $doc.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)
+
+    if ($payload.PSObject.Properties['preview_image_data_url'] -and $payload.preview_image_data_url) {
+        $dataUrl = $payload.preview_image_data_url.ToString()
+        $commaIndex = $dataUrl.IndexOf(',')
+        if ($commaIndex -gt 0) {
+            $base64 = $dataUrl.Substring($commaIndex + 1)
+            $bytes = [Convert]::FromBase64String($base64)
+            $stream = New-Object System.IO.MemoryStream(,$bytes)
+            $previewImage = [System.Drawing.Image]::FromStream($stream)
+            $imageHandler = [System.Drawing.Printing.PrintPageEventHandler] {
+                param($sender, $e)
+                $g = $e.Graphics
+                $g.Clear([System.Drawing.Color]::White)
+                $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+                $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+                if ($printerProfile -eq "brother_ql_windows") {
+                    # Draw the captured preview into the exact requested label design size.
+                    # Do not shrink, center, or shift for printable margins here: if content is outside
+                    # the real printer area, let the printer clip it naturally instead of moving layout.
+                    $targetWidth = $labelLengthHi
+                    $targetHeight = $labelWidthHi
+                    $targetX = 0
+                    $targetY = 0
+                } else {
+                    $targetWidth = $e.PageBounds.Width
+                    $targetHeight = $e.PageBounds.Height
+                    $targetX = 0
+                    $targetY = 0
+                }
+                $dest = New-Object System.Drawing.Rectangle($targetX, $targetY, $targetWidth, $targetHeight)
+                $g.DrawImage($previewImage, $dest)
+                $e.HasMorePages = $false
+            }
+            $doc.add_PrintPage($imageHandler)
+            $doc.Print()
+            $previewImage.Dispose()
+            $stream.Dispose()
+            [ordered]@{
+                status = "printed"
+                printer = $doc.PrinterSettings.PrinterName
+                render_mode = "preview_image"
+                label_width_mm = $LabelWidthMm
+                label_length_mm = $LabelLengthMm
+                paper_size = $doc.DefaultPageSettings.PaperSize.PaperName
+                paper_raw_kind = $doc.DefaultPageSettings.PaperSize.RawKind
+                driver_media_name = $driverMediaName
+                printer_profile = $printerProfile
+                print_orientation = $printOrientation
+            } | ConvertTo-Json -Depth 10
+            exit 0
+        }
+    }
 
     $fontTitle = Get-FieldFont -Payload $payload -Field "product_name" -DefaultFamily "Arial" -DefaultSize 11 -Style ([System.Drawing.FontStyle]::Bold)
     $fontSku = Get-FieldFont -Payload $payload -Field "product_number" -DefaultFamily "Consolas" -DefaultSize 10 -Style ([System.Drawing.FontStyle]::Bold)
@@ -297,7 +395,19 @@ try {
         $y = 8
         $line = 16
         $pageWidth = $e.PageBounds.Width
-        $contentWidth = [Math]::Max(100, $pageWidth - 20)
+        $pageHeight = $e.PageBounds.Height
+        # Draw against the requested label design size, not the driver's larger continuous-media page.
+        # This keeps preview and print from reflowing when Brother reports a bigger printable area.
+        $designWidth = if ($printerProfile -eq "brother_ql_windows") { $labelLengthHi } else { $pageWidth }
+        $designHeight = if ($printerProfile -eq "brother_ql_windows") { $labelWidthHi } else { $pageHeight }
+        $contentWidth = [Math]::Max(100, $designWidth - 20)
+        # Layout offsets are stored in physical millimeters by the live preview.
+        # PrintDocument uses hundredths of an inch, so use the same physical coordinates here.
+        $offsetScaleX = 100.0 / 25.4
+        $offsetScaleY = 100.0 / 25.4
+        $clipFormat = New-Object System.Drawing.StringFormat
+        $clipFormat.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+        $clipFormat.Trimming = [System.Drawing.StringTrimming]::None
 
         $productName = if ($payload.product_name) { $payload.product_name.ToString() } else { "Product" }
         $productNumber = if ($payload.product_number) { $payload.product_number.ToString() } else { "" }
@@ -321,28 +431,50 @@ try {
         $barcodeHeightPx = [int][Math]::Round(18 + ($barcodeHeightPct * 0.65))
 
         if ($layoutPreset -eq "stacked") {
-            $g.DrawString($productNumber, $fontSku, $black, $x, $y)
-            $titleYStack = $y + 15
-            $titleRectStack = New-Object System.Drawing.RectangleF($x, $titleYStack, $contentWidth, 24)
-            $g.DrawString($productName, $fontTitle, $black, $titleRectStack)
-            $y += 42
+            $opnX = [int]([double]$offProductNumber.x * $offsetScaleX); $opnY = [int]([double]$offProductNumber.y * $offsetScaleY); $opnS = [double]$offProductNumber.scale
+            $opdX = [int]([double]$offProductName.x * $offsetScaleX); $opdY = [int]([double]$offProductName.y * $offsetScaleY); $opdS = [double]$offProductName.scale
+            $obcX = [int]([double]$offBarcode.x * $offsetScaleX); $obcY = [int]([double]$offBarcode.y * $offsetScaleY); $obcS = [double]$offBarcode.scale
+            $odtX = [int]([double]$offDetails.x * $offsetScaleX); $odtY = [int]([double]$offDetails.y * $offsetScaleY); $odtS = [double]$offDetails.scale
+            $ontX = [int]([double]$offNotes.x * $offsetScaleX); $ontY = [int]([double]$offNotes.y * $offsetScaleY); $ontS = [double]$offNotes.scale
+            $skuFont = New-ScaledFont -Font $fontSku -Scale $opnS
+            $titleFont = New-ScaledFont -Font $fontTitle -Scale $opdS
+            $detailsFont = New-ScaledFont -Font $fontSmall -Scale $odtS
+            $notesFont = New-ScaledFont -Font $fontSmall -Scale $ontS
+            $barcodeFontScaled = New-ScaledFont -Font $fontBarcode -Scale $obcS
+
+            $topY = $y
+            if (Test-DisplayField -Payload $payload -Field "product_number") { $g.DrawString($productNumber, $skuFont, $black, [int]($x + $opnX), [int]($topY + $opnY)) }
+            $titleYStack = [int]($topY + 15 + $opdY)
+            $titleRectStack = New-Object System.Drawing.RectangleF([int]($x + $opdX), $titleYStack, $contentWidth, 24)
+            if (Test-DisplayField -Payload $payload -Field "product_name") { $g.DrawString($productName, $titleFont, $black, $titleRectStack) }
+
+            # Match the browser stacked preview order: title block, details/notes, then barcode.
+            # This avoids barcode/title overlap when custom fonts or drag offsets are used.
+            $y = $topY + 46
+            $detailsText = Get-DetailsText -Payload $payload -Quantity $quantity -ItemType $itemType -Weight $weight
+            if ($detailsText.Length -gt 0) {
+                $detailsRectStack = New-Object System.Drawing.RectangleF([int]($x + $odtX), [int]($y + $odtY), $contentWidth, 14)
+                $g.DrawString($detailsText, $detailsFont, $black, $detailsRectStack)
+                $y += 16
+            }
+            if ((Test-DisplayField -Payload $payload -Field "notes") -and $notes.Length -gt 0) {
+                $rectStack = New-Object System.Drawing.RectangleF([int]($x + $ontX), [int]($y + $ontY), $contentWidth, 18)
+                $g.DrawString("Notes: $notes", $notesFont, $black, $rectStack)
+                $y += 18
+            }
+
             $stackBarcodeWidth = [Math]::Min($contentWidth, [Math]::Max(90, [int]($contentWidth * (($barcodeWidthPct + 45) / 100))))
-            $stackBarcodeX = $x + [Math]::Floor(($contentWidth - $stackBarcodeWidth) / 2)
-            Draw-Code128B -Graphics $g -Text $barcode -X $stackBarcodeX -Y $y -Width $stackBarcodeWidth -Height 36 -Brush $black
-            $barcodeTextYStack = $y + 38
-            $barcodeTextRectStack = New-Object System.Drawing.RectangleF($stackBarcodeX, $barcodeTextYStack, $stackBarcodeWidth, 10)
-            $barcodeFormatStack = New-Object System.Drawing.StringFormat
-            $barcodeFormatStack.Alignment = [System.Drawing.StringAlignment]::Center
-            $g.DrawString($barcode, $fontBarcode, $black, $barcodeTextRectStack, $barcodeFormatStack)
-            $y += 52
-            $colWStack = [Math]::Floor($contentWidth / 3)
-            $g.DrawString("QTY $quantity", $fontSmall, $black, $x, $y)
-            $g.DrawString("TYPE $itemType", $fontSmall, $black, $x + $colWStack, $y)
-            $g.DrawString("WT $weight", $fontSmall, $black, $x + ($colWStack * 2), $y)
-            $y += 12
-            if ($notes.Length -gt 0) {
-                $rectStack = New-Object System.Drawing.RectangleF($x, $y, $contentWidth, 22)
-                $g.DrawString("Notes: $notes", $fontSmall, $black, $rectStack)
+            $stackBarcodeWidth = [int]($stackBarcodeWidth * $obcS)
+            $stackBarcodeX = [int]($x + [Math]::Floor(($contentWidth - $stackBarcodeWidth) / 2) + $obcX)
+            $stackBarcodeY = [int]($y + 4 + $obcY)
+            $stackBarcodeHeight = [int]($barcodeHeightPx * $obcS)
+            $barcodeTextYStack = [int]($stackBarcodeY + $stackBarcodeHeight + 2)
+            if (Test-DisplayField -Payload $payload -Field "barcode") {
+                Draw-Code128B -Graphics $g -Text $barcode -X $stackBarcodeX -Y $stackBarcodeY -Width $stackBarcodeWidth -Height $stackBarcodeHeight -Brush $black
+                $barcodeTextRectStack = New-Object System.Drawing.RectangleF($stackBarcodeX, $barcodeTextYStack, $stackBarcodeWidth, 10)
+                $barcodeFormatStack = New-Object System.Drawing.StringFormat
+                $barcodeFormatStack.Alignment = [System.Drawing.StringAlignment]::Center
+                $g.DrawString($barcode, $barcodeFontScaled, $black, $barcodeTextRectStack, $barcodeFormatStack)
             }
             $e.HasMorePages = $false
             return
@@ -387,22 +519,11 @@ try {
             return
         }
 
-        $barcodeWidth = [Math]::Min(130, [Math]::Max(88, [int]($contentWidth * ($barcodeWidthPct / 100))))
-        $leftWidth = $contentWidth - $barcodeWidth - 6
-        $barcodeX = $x + $leftWidth + 6
-        $textX = $x
-
-        if ($layoutPreset -eq "barcode_left") {
-            $barcodeX = $x
-            $textX = $x + $barcodeWidth + 6
-            $leftWidth = $contentWidth - $barcodeWidth - 6
-        }
-
-        $opnX = [int]$offProductNumber.x; $opnY = [int]$offProductNumber.y; $opnS = [double]$offProductNumber.scale
-        $opdX = [int]$offProductName.x; $opdY = [int]$offProductName.y; $opdS = [double]$offProductName.scale
-        $obcX = [int]$offBarcode.x; $obcY = [int]$offBarcode.y; $obcS = [double]$offBarcode.scale
-        $odtX = [int]$offDetails.x; $odtY = [int]$offDetails.y; $odtS = [double]$offDetails.scale
-        $ontX = [int]$offNotes.x; $ontY = [int]$offNotes.y; $ontS = [double]$offNotes.scale
+        $opnX = [int]([double]$offProductNumber.x * $offsetScaleX); $opnY = [int]([double]$offProductNumber.y * $offsetScaleY); $opnS = [double]$offProductNumber.scale
+        $opdX = [int]([double]$offProductName.x * $offsetScaleX); $opdY = [int]([double]$offProductName.y * $offsetScaleY); $opdS = [double]$offProductName.scale
+        $obcX = [int]([double]$offBarcode.x * $offsetScaleX); $obcY = [int]([double]$offBarcode.y * $offsetScaleY); $obcS = [double]$offBarcode.scale
+        $odtX = [int]([double]$offDetails.x * $offsetScaleX); $odtY = [int]([double]$offDetails.y * $offsetScaleY); $odtS = [double]$offDetails.scale
+        $ontX = [int]([double]$offNotes.x * $offsetScaleX); $ontY = [int]([double]$offNotes.y * $offsetScaleY); $ontS = [double]$offNotes.scale
 
         $skuFont = New-ScaledFont -Font $fontSku -Scale $opnS
         $titleFont = New-ScaledFont -Font $fontTitle -Scale $opdS
@@ -410,46 +531,59 @@ try {
         $notesFont = New-ScaledFont -Font $fontSmall -Scale $ontS
         $barcodeFontScaled = New-ScaledFont -Font $fontBarcode -Scale $obcS
 
-        $skuX = [int]($textX + $opnX); $skuY = [int]($y + $opnY)
-        if (Test-DisplayField -Payload $payload -Field "product_number") { $g.DrawString($productNumber, $skuFont, $black, $skuX, $skuY) }
-        $titleY = [int]($y + 16 + $opdY)
-        $titleX = [int]($textX + $opdX)
-        $titleRect = New-Object System.Drawing.RectangleF($titleX, $titleY, $leftWidth, 28)
-        if (Test-DisplayField -Payload $payload -Field "product_name") { $g.DrawString($productName, $titleFont, $black, $titleRect) }
-
-        $barcodeDrawWidth = [int]($barcodeWidth * $obcS)
+        # Fixed physical anchors. Do not reflow or shift other fields if text/barcode is too large.
+        # Anything outside its rectangle is clipped/truncated by GDI instead of moving layout.
+        $detailsTop = [int]($designHeight * 0.47)
+        $titleTop = [int]($designHeight * 0.78)
+        $barcodeBaseWidth = [Math]::Min([int]($designWidth * 0.34), [Math]::Max(82, [int]($contentWidth * ($barcodeWidthPct / 100))))
+        $barcodeDrawWidth = [int]($barcodeBaseWidth * $obcS)
         $barcodeDrawHeight = [int]($barcodeHeightPx * $obcS)
-        $barcodeDrawX = [int]($barcodeX + $obcX)
+        $barcodeDrawX = [int]($x + [Math]::Floor(($designWidth - $barcodeDrawWidth) / 2) + $obcX)
+        if ($layoutPreset -eq "barcode_left") { $barcodeDrawX = [int]($x + $obcX) }
         $barcodeDrawY = [int]($y + $obcY)
+
+        if (Test-DisplayField -Payload $payload -Field "product_number") {
+            $skuRect = New-Object System.Drawing.RectangleF([int]($x + $opnX), [int]($y + $opnY), [int]($designWidth * 0.30), 18)
+            $g.DrawString($productNumber, $skuFont, $black, $skuRect, $clipFormat)
+        }
+        if (Test-DisplayField -Payload $payload -Field "product_name") {
+            $titleRect = New-Object System.Drawing.RectangleF([int]($x + $opdX), [int]($titleTop + $opdY), [int]($designWidth * 0.46), 24)
+            $g.DrawString($productName, $titleFont, $black, $titleRect, $clipFormat)
+        }
+
         if (Test-DisplayField -Payload $payload -Field "barcode") {
             Draw-Code128B -Graphics $g -Text $barcode -X $barcodeDrawX -Y $barcodeDrawY -Width $barcodeDrawWidth -Height $barcodeDrawHeight -Brush $black
-            $barcodeTextY = [int]($y + $obcY + $barcodeDrawHeight + 2)
-            $barcodeTextRect = New-Object System.Drawing.RectangleF($barcodeDrawX, $barcodeTextY, $barcodeDrawWidth, 12)
+            $barcodeTextRect = New-Object System.Drawing.RectangleF($barcodeDrawX, [int]($barcodeDrawY + $barcodeDrawHeight + 2), $barcodeDrawWidth, 12)
             $barcodeFormat = New-Object System.Drawing.StringFormat
             $barcodeFormat.Alignment = [System.Drawing.StringAlignment]::Center
+            $barcodeFormat.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
             $g.DrawString($barcode, $barcodeFontScaled, $black, $barcodeTextRect, $barcodeFormat)
         }
 
-        $y += 52
-        $colW = [Math]::Floor($contentWidth / 3)
-        $detailsX = [int]($x + $odtX)
-        $detailsY = [int]($y + $odtY)
-        if (Test-DisplayField -Payload $payload -Field "quantity") { $g.DrawString("QTY $quantity", $detailsFont, $black, $detailsX, $detailsY) }
-        if (Test-DisplayField -Payload $payload -Field "item_type") { $g.DrawString("TYPE $itemType", $detailsFont, $black, [int]($detailsX + $colW), $detailsY) }
-        if (Test-DisplayField -Payload $payload -Field "weight") { $g.DrawString("WT $weight", $detailsFont, $black, [int]($detailsX + ($colW * 2)), $detailsY) }
-        $y += 12
-
+        $detailW = [int]($designWidth * 0.18)
+        if (Test-DisplayField -Payload $payload -Field "item_type") {
+            $itemRect = New-Object System.Drawing.RectangleF([int]($x + $odtX), [int]($detailsTop + $odtY), $detailW, 25)
+            $g.DrawString("ITEM TYPE`n$itemType", $detailsFont, $black, $itemRect)
+        }
+        if (Test-DisplayField -Payload $payload -Field "weight") {
+            $weightRect = New-Object System.Drawing.RectangleF([int]($x + ($designWidth * 0.22) + $odtX), [int]($detailsTop + $odtY), $detailW, 25)
+            $g.DrawString("WEIGHT`n$weight", $detailsFont, $black, $weightRect)
+        }
+        if (Test-DisplayField -Payload $payload -Field "quantity") {
+            $qtyRect = New-Object System.Drawing.RectangleF([int]($x + ($designWidth * 0.40) + $odtX), [int]($detailsTop + $odtY), $detailW, 25)
+            $g.DrawString("QTY`n$quantity", $detailsFont, $black, $qtyRect)
+        }
         if ((Test-DisplayField -Payload $payload -Field "notes") -and $notes.Length -gt 0) {
-            $notesX = [int]($x + $ontX); $notesY = [int]($y + $ontY)
-            $rect = New-Object System.Drawing.RectangleF($notesX, $notesY, $contentWidth, 26)
-            $g.DrawString("Notes: $notes", $notesFont, $black, $rect)
+            $notesRect = New-Object System.Drawing.RectangleF([int]($x + ($designWidth * 0.57) + $ontX), [int]($detailsTop + $ontY), [int]($designWidth * 0.22), 30)
+            $g.DrawString("NOTES`n$notes", $notesFont, $black, $notesRect)
         }
 
         if ($payload.PSObject.Properties['show_qr'] -and $payload.show_qr) {
+            $offQr = Get-LayoutOffset -Payload $payload -Field "qr_code"
             $qrSize = 46
             $cell = 4
-            $qrX = [Math]::Max(2, $pageWidth - $qrSize - 8)
-            $qrY = [Math]::Max(2, $e.PageBounds.Height - $qrSize - 8)
+            $qrX = [Math]::Max(2, $pageWidth - $qrSize - 8 + ([double]$offQr.x * $offsetScaleX))
+            $qrY = [Math]::Max(2, $pageHeight - $qrSize - 8 + ([double]$offQr.y * $offsetScaleY))
             $g.FillRectangle([System.Drawing.Brushes]::White, $qrX, $qrY, $qrSize, $qrSize)
             $g.DrawRectangle([System.Drawing.Pens]::Black, $qrX, $qrY, $qrSize, $qrSize)
             $source = "$barcode|$productName"
