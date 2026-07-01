@@ -145,6 +145,8 @@ try {
     }
 
     $printerProfile = if ($payload.printer_profile) { $payload.printer_profile.ToString() } else { "brother_ql_windows" }
+    $printOrientation = if ($payload.PSObject.Properties['print_orientation'] -and $payload.print_orientation) { $payload.print_orientation.ToString().ToLowerInvariant() } else { "horizontal" }
+    if ($printOrientation -ne "vertical") { $printOrientation = "horizontal" }
 
     if ($printerProfile -eq "zebra_zpl") {
         $dpi = if ($payload.PSObject.Properties['zpl_dpi'] -and $payload.zpl_dpi) { [int]$payload.zpl_dpi } else { 203 }
@@ -163,16 +165,17 @@ try {
         if ($barcodeHeight -lt 70) { $barcodeHeight = 70 }
         if ($barcodeHeight -gt 150) { $barcodeHeight = 150 }
         $safeBarcode = ($barcode -replace '[\^~]', '')
+        $zplOrient = if ($printOrientation -eq "vertical") { "R" } else { "N" }
         $zpl = "^XA`n"
         $zpl += "^CI28`n^PW$labelWidthDots`n^LL$labelLengthDots`n^LH0,0`n"
-        $zpl += "^FO20,18^A0N,30,30^FD$productNumber^FS`n"
-        $zpl += "^FO20,52^A0N,24,24^FB$($labelWidthDots - 40),2,0,L,0^FD$productName^FS`n"
-        $zpl += "^FO20,105^BY2,2,$barcodeHeight^BCN,$barcodeHeight,Y,N,N^FD$safeBarcode^FS`n"
-        $zpl += "^FO20,$($barcodeHeight + 185)^A0N,20,20^FDQTY $quantity   TYPE $itemType   WT $weight^FS`n"
-        if ($notes.Length -gt 0) { $zpl += "^FO20,$($barcodeHeight + 212)^A0N,18,18^FB$($labelWidthDots - 40),2,0,L,0^FD$notes^FS`n" }
+        $zpl += "^FO20,18^A0$zplOrient,30,30^FD$productNumber^FS`n"
+        $zpl += "^FO20,52^A0$zplOrient,24,24^FB$($labelWidthDots - 40),2,0,L,0^FD$productName^FS`n"
+        $zpl += "^FO20,105^BY2,2,$barcodeHeight^BC$zplOrient,$barcodeHeight,Y,N,N^FD$safeBarcode^FS`n"
+        $zpl += "^FO20,$($barcodeHeight + 185)^A0$zplOrient,20,20^FDQTY $quantity   TYPE $itemType   WT $weight^FS`n"
+        if ($notes.Length -gt 0) { $zpl += "^FO20,$($barcodeHeight + 212)^A0$zplOrient,18,18^FB$($labelWidthDots - 40),2,0,L,0^FD$notes^FS`n" }
         $zpl += "^XZ`n"
         Send-RawToPrinter -PrinterName $settings.PrinterName -DocumentName "Product label ZPL" -Data $zpl
-        [ordered]@{ status = "printed"; printer = $settings.PrinterName; printer_profile = $printerProfile; zpl_dpi = $dpi; label_width_mm = $LabelWidthMm; label_length_mm = $LabelLengthMm } | ConvertTo-Json -Depth 10
+        [ordered]@{ status = "printed"; printer = $settings.PrinterName; printer_profile = $printerProfile; zpl_dpi = $dpi; print_orientation = $printOrientation; label_width_mm = $LabelWidthMm; label_length_mm = $LabelLengthMm } | ConvertTo-Json -Depth 10
         exit 0
     }
 
@@ -226,7 +229,7 @@ try {
     }
 
     $doc.DefaultPageSettings.PaperSize = $paperSize
-    $doc.DefaultPageSettings.Landscape = $true
+    $doc.DefaultPageSettings.Landscape = ($printOrientation -eq "horizontal")
     $doc.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)
 
     $fontTitle = New-Object System.Drawing.Font("Arial", 11, [System.Drawing.FontStyle]::Bold)
@@ -406,6 +409,7 @@ try {
         paper_raw_kind = $doc.DefaultPageSettings.PaperSize.RawKind
         driver_media_name = $driverMediaName
         printer_profile = $printerProfile
+        print_orientation = $printOrientation
     }
     $result | ConvertTo-Json -Depth 10
     exit 0

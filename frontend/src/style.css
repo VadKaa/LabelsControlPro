@@ -290,8 +290,17 @@ input[type='range'] { padding: 0; accent-color: var(--primary); }
 .label-tape.minimal .product, .label-tape.minimal .label-data { display: none; }
 .label-tape.minimal .sku { text-align: center; font-size: clamp(22px, 3vw, 34px); }
 .label-tape.minimal .barcode { height: 70px; width: 100%; }
+.label-tape.vertical { align-content: start; gap: 14px; }
+.label-tape.vertical::before, .label-tape.vertical::after { left: 0; right: 0; top: -6px; bottom: auto; width: auto; height: 10px; }
+.label-tape.vertical::after { top: auto; bottom: -6px; }
+.label-tape.vertical .label-left { padding-right: 0; }
+.label-tape.vertical .label-data { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.label-tape.vertical .barcode { width: 100%; }
+.draggable-field { cursor: grab; touch-action: none; border-radius: 4px; }
+.draggable-field:active { cursor: grabbing; }
+.draggable-field.selected { outline: 1px dashed rgba(37, 99, 235, .85); outline-offset: 3px; }
 
-.hardware-grid, .queue-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.queue-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .queue-summary { margin-bottom: 16px; }
 .queue-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
 .profile-panel { margin-top: 18px; border: 1px solid var(--line); background: rgba(6,14,32,.45); padding: 16px; }
@@ -344,7 +353,7 @@ input[type='range'] { padding: 0; accent-color: var(--primary); }
   .topbar { height: auto; min-height: 64px; align-items: flex-start; flex-direction: column; padding: 14px; gap: 12px; }
   .top-actions { flex-wrap: wrap; }
   .workbench { padding: 16px; }
-  .form-grid, .hardware-grid, .queue-summary, .profile-grid, .design-guide, .media-grid, .template-save-row, .nudge-pad { grid-template-columns: 1fr; }
+  .form-grid, .queue-summary, .profile-grid, .design-guide, .media-grid, .template-save-row, .nudge-pad { grid-template-columns: 1fr; }
   .label-tape { grid-template-columns: 1fr; padding: 34px 24px; }
   .label-left { border-right: 0; border-bottom: 1px solid #e2e8f0; padding-right: 0; padding-bottom: 18px; }
   .label-data { grid-template-columns: 1fr 1fr; }

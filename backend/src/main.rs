@@ -47,12 +47,18 @@ struct LabelRequest {
     printer_profile: String,
     #[serde(default = "default_zpl_dpi")]
     zpl_dpi: u16,
+    #[serde(default = "default_print_orientation")]
+    print_orientation: String,
     #[serde(default)]
     layout_offsets: serde_json::Value,
 }
 
 fn default_zpl_dpi() -> u16 {
     203
+}
+
+fn default_print_orientation() -> String {
+    "horizontal".to_string()
 }
 
 fn default_printer_profile() -> String {
@@ -474,6 +480,7 @@ async fn create_label(Json(payload): Json<LabelRequest>) -> Json<serde_json::Val
             "driver_media_name": payload.driver_media_name,
             "printer_profile": payload.printer_profile,
             "zpl_dpi": payload.zpl_dpi,
+            "print_orientation": payload.print_orientation,
             "layout_offsets": payload.layout_offsets
         }
     }))

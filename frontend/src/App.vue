@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 
 type LayoutFieldKey = 'product_number' | 'product_name' | 'barcode' | 'details' | 'notes'
 
@@ -27,6 +27,7 @@ type LabelPayload = {
   driver_media_name: string
   printer_profile: string
   zpl_dpi: number
+  print_orientation: 'horizontal' | 'vertical'
   layout_offsets: Record<LayoutFieldKey, LayoutOffset>
 }
 
@@ -84,6 +85,7 @@ const form = reactive<LabelPayload>({
   driver_media_name: '62mm',
   printer_profile: 'brother_ql_windows',
   zpl_dpi: 203,
+  print_orientation: 'horizontal',
   layout_offsets: {
     product_number: { x: 0, y: 0, scale: 1 },
     product_name: { x: 0, y: 0, scale: 1 },
@@ -108,7 +110,10 @@ const templateName = ref('')
 const templateSearch = ref('')
 const newTemplatesCount = ref(0)
 const driverLoading = ref(false)
+const printCopies = ref(1)
+const printedCount = ref(0)
 const selectedLayoutField = ref<LayoutFieldKey>('barcode')
+const dragState = ref<{ field: LayoutFieldKey; startX: number; startY: number; originX: number; originY: number } | null>(null)
 const layoutFields: Array<{ key: LayoutFieldKey; label: string }> = [
   { key: 'product_number', label: 'Product Number' },
   { key: 'product_name', label: 'Product Name' },
@@ -136,6 +141,9 @@ const selectedMedia = computed(() => `${form.label_width_mm}mm x ${form.label_le
 const selectedDriverMedia = computed(() => printerMedia.value.find((media) => media.name === form.driver_media_name))
 const usefulMedia = computed(() => printerMedia.value.filter((media) => media.name.includes('62mm') || media.continuous).slice(0, 30))
 const stuckJobs = computed(() => printJobs.value.filter((job) => isStuckJob(job)).length)
+const normalizedPrintCopies = computed(() => Math.min(100, Math.max(1, Number(printCopies.value) || 1)))
+const printProgressPercent = computed(() => Math.round((printedCount.value / normalizedPrintCopies.value) * 100))
+const printProgressLabel = computed(() => `${printedCount.value} / ${normalizedPrintCopies.value} labels printed`)
 const filteredTemplates = computed(() => {
   const query = templateSearch.value.trim().toLowerCase()
   if (!query) return templates.value
@@ -149,14 +157,15 @@ const filteredTemplates = computed(() => {
     return fields.some((field) => (field || '').toLowerCase().includes(query))
   })
 })
-const previewKey = computed(() => `${form.label_width_mm}-${form.label_length_mm}-${form.layout_preset}-${JSON.stringify(form.layout_offsets)}-${form.product_number}-${form.product_name}-${form.barcode}`)
+const previewKey = computed(() => `${form.label_width_mm}-${form.label_length_mm}-${form.layout_preset}-${form.print_orientation}-${form.product_number}-${form.product_name}-${form.barcode}`)
 const labelTapeStyle = computed(() => {
-  const width = Math.min(900, Math.max(320, form.label_length_mm * 9))
-  const height = Math.min(320, Math.max(145, form.label_width_mm * 2.35))
+  const isVertical = form.print_orientation === 'vertical'
+  const width = isVertical ? Math.min(420, Math.max(210, form.label_width_mm * 4.2)) : Math.min(900, Math.max(320, form.label_length_mm * 9))
+  const height = isVertical ? Math.min(900, Math.max(320, form.label_length_mm * 5.5)) : Math.min(320, Math.max(145, form.label_width_mm * 2.35))
   return {
     width: `${width}px`,
     minHeight: `${height}px`,
-    gridTemplateColumns: ['stacked', 'barcode_bottom', 'minimal'].includes(form.layout_preset) ? '1fr' : 'minmax(0, 58fr) 42fr',
+    gridTemplateColumns: isVertical || ['stacked', 'barcode_bottom', 'minimal'].includes(form.layout_preset) ? '1fr' : 'minmax(0, 58fr) 42fr',
   }
 })
 
@@ -178,6 +187,31 @@ function scaleField(delta: number) {
   const field = form.layout_offsets[selectedLayoutField.value]
   field.scale = Math.min(1.5, Math.max(0.65, Number((field.scale + delta).toFixed(2))))
 }
+
+function startDrag(field: LayoutFieldKey, event: PointerEvent) {
+  selectedLayoutField.value = field
+  const offset = form.layout_offsets[field]
+  dragState.value = { field, startX: event.clientX, startY: event.clientY, originX: offset.x, originY: offset.y }
+  window.addEventListener('pointermove', dragField)
+  window.addEventListener('pointerup', stopDrag, { once: true })
+}
+
+function dragField(event: PointerEvent) {
+  if (!dragState.value) return
+  const offset = form.layout_offsets[dragState.value.field]
+  offset.x = dragState.value.originX + event.clientX - dragState.value.startX
+  offset.y = dragState.value.originY + event.clientY - dragState.value.startY
+}
+
+function stopDrag() {
+  dragState.value = null
+  window.removeEventListener('pointermove', dragField)
+}
+
+watch(printCopies, () => {
+  if (loading.value) return
+  printedCount.value = 0
+})
 
 function resetField() {
   form.layout_offsets[selectedLayoutField.value] = { x: 0, y: 0, scale: 1 }
@@ -436,27 +470,37 @@ async function submitLabel() {
   loading.value = true
   error.value = ''
   statusMessage.value = ''
+  printedCount.value = 0
+  printCopies.value = normalizedPrintCopies.value
 
   try {
-    const payload = { ...form, print: true }
-    const res = await fetch(`${API_BASE}/label`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
+    const totalCopies = normalizedPrintCopies.value
 
-    const text = await res.text()
+    for (let copy = 1; copy <= totalCopies; copy += 1) {
+      const payload = { ...form, print: true }
+      const res = await fetch(`${API_BASE}/label`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
 
-    if (!res.ok) {
-      throw new Error(text || `HTTP ${res.status}`)
+      const text = await res.text()
+
+      if (!res.ok) {
+        throw new Error(text || `HTTP ${res.status}`)
+      }
+
+      const data = JSON.parse(text)
+      if (data.print?.status === 'error') {
+        const message = data.print.details?.error || data.print.error || 'Printer returned an error'
+        throw new Error(message)
+      }
+
+      printedCount.value = copy
+      statusMessage.value = `Printing labels: ${copy} / ${totalCopies}`
     }
 
-    const data = JSON.parse(text)
-    if (data.print?.status === 'error') {
-      const message = data.print.details?.error || data.print.error || 'Printer returned an error'
-      throw new Error(message)
-    }
-    statusMessage.value = data.print?.status === 'printed' ? 'Label sent to printer.' : 'Label saved.'
+    statusMessage.value = totalCopies === 1 ? 'Label sent to printer.' : `${totalCopies} labels sent to printer.`
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Unknown error'
   } finally {
@@ -467,6 +511,10 @@ async function submitLabel() {
 onMounted(async () => {
   await loadPrinters()
   await loadPrinterMedia()
+})
+
+onUnmounted(() => {
+  window.removeEventListener('pointermove', dragField)
 })
 </script>
 
@@ -506,12 +554,12 @@ onMounted(async () => {
 
       <div class="status-card">
         <div class="status-row">
-          <span>Printer Status</span>
-          <strong :class="statusClass">{{ statusLabel }}</strong>
+          <span>Print Status</span>
+          <strong>{{ printProgressPercent }}%</strong>
         </div>
-        <div class="meter"><span :style="{ width: printerOnline ? '85%' : '8%' }"></span></div>
+        <div class="meter"><span :style="{ width: `${printProgressPercent}%` }"></span></div>
+        <small>{{ printProgressLabel }}</small>
         <small>{{ selectedPrinter?.Name || 'No printer selected' }}</small>
-        <small>USB media: {{ selectedMedia }}</small>
         <small v-if="!brotherInstalled" class="warn">Brother printer not detected in Windows</small>
       </div>
     </aside>
@@ -601,6 +649,13 @@ onMounted(async () => {
                 </select>
               </label>
               <label>
+                Print Orientation
+                <select v-model="form.print_orientation">
+                  <option value="horizontal">Horizontal / landscape</option>
+                  <option value="vertical">Vertical / portrait</option>
+                </select>
+              </label>
+              <label>
                 Layout Preset
                 <select v-model="form.layout_preset">
                   <option value="compact_right">Compact: barcode right</option>
@@ -646,8 +701,13 @@ onMounted(async () => {
               <input v-model.number="form.print_density" max="10" min="1" type="range" />
             </label>
 
+            <label>
+              Labels To Print
+              <input v-model.number="printCopies" max="100" min="1" type="number" />
+            </label>
+
             <button class="primary full" :disabled="loading" type="button" @click="submitLabel">
-              {{ loading ? 'PRINTING...' : 'PRINT NOW' }}
+              {{ loading ? `PRINTING ${printedCount} / ${normalizedPrintCopies}` : 'PRINT NOW' }}
             </button>
           </div>
         </form>
@@ -666,15 +726,15 @@ onMounted(async () => {
         </div>
 
         <div class="canvas-grid">
-          <div :key="previewKey" class="label-tape" :class="form.layout_preset" :style="labelTapeStyle">
-            <div class="tape-meta top">Brother QL / {{ form.driver_media_name || selectedMedia }} / Code128</div>
+          <div :key="previewKey" class="label-tape" :class="[form.layout_preset, form.print_orientation]" :style="labelTapeStyle">
+            <div class="tape-meta top">Brother QL / {{ form.driver_media_name || selectedMedia }} / {{ form.print_orientation }} / Code128</div>
             <div class="label-left">
               <div>
-                <div class="sku" :style="fieldStyle('product_number')">{{ form.product_number || 'SKU-000' }}</div>
-                <div class="product" :style="fieldStyle('product_name')">{{ form.product_name || 'Product name' }}</div>
+                <div class="sku draggable-field" :class="{ selected: selectedLayoutField === 'product_number' }" :style="fieldStyle('product_number')" @pointerdown.stop.prevent="startDrag('product_number', $event)">{{ form.product_number || 'SKU-000' }}</div>
+                <div class="product draggable-field" :class="{ selected: selectedLayoutField === 'product_name' }" :style="fieldStyle('product_name')" @pointerdown.stop.prevent="startDrag('product_name', $event)">{{ form.product_name || 'Product name' }}</div>
               </div>
 
-              <div class="label-data" :style="fieldStyle('details')">
+              <div class="label-data draggable-field" :class="{ selected: selectedLayoutField === 'details' }" :style="fieldStyle('details')" @pointerdown.stop.prevent="startDrag('details', $event)">
                 <div>
                   <span>ITEM TYPE</span>
                   <strong>{{ form.item_type || 'TYPE' }}</strong>
@@ -689,12 +749,12 @@ onMounted(async () => {
                 </div>
                 <div>
                   <span>NOTES</span>
-                  <strong :style="fieldStyle('notes')">{{ form.notes || 'NONE' }}</strong>
+                  <strong class="draggable-field" :class="{ selected: selectedLayoutField === 'notes' }" :style="fieldStyle('notes')" @pointerdown.stop.prevent="startDrag('notes', $event)">{{ form.notes || 'NONE' }}</strong>
                 </div>
               </div>
             </div>
 
-            <div class="barcode-box" :style="fieldStyle('barcode')">
+            <div class="barcode-box draggable-field" :class="{ selected: selectedLayoutField === 'barcode' }" :style="fieldStyle('barcode')" @pointerdown.stop.prevent="startDrag('barcode', $event)">
               <div class="barcode">
                 <i
                   v-for="(bar, index) in barcodeBars"
@@ -707,24 +767,6 @@ onMounted(async () => {
           </div>
         </div>
 
-        <div class="hardware-grid">
-          <div class="mini-card">
-            <span>PRINTER</span>
-            <strong>{{ selectedPrinter?.Name || 'Default printer' }}</strong>
-          </div>
-          <div class="mini-card">
-            <span>PORT</span>
-            <strong>{{ selectedPrinter?.PortName || 'AUTO' }}</strong>
-          </div>
-          <div class="mini-card">
-            <span>MEDIA</span>
-            <strong>{{ form.driver_media_name || selectedMedia }}</strong>
-          </div>
-          <div class="mini-card" :class="statusClass">
-            <span>STATUS</span>
-            <strong>{{ statusLabel }}</strong>
-          </div>
-        </div>
 
         <div class="design-guide">
           <div>
