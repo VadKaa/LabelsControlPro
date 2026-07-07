@@ -12,7 +12,10 @@ use std::{
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tower_http::cors::CorsLayer;
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+};
 
 #[derive(Clone, Deserialize, Serialize)]
 struct LabelRequest {
@@ -113,11 +116,40 @@ struct SaveTemplateRequest {
     label: LabelRequest,
 }
 
+fn app_root() -> PathBuf {
+    std::env::var("APP_ROOT")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn templates_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("printer")
-        .join("Templates")
+    std::env::var("TEMPLATES_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| app_root().join("printer").join("Templates"))
+}
+
+fn scripts_dir() -> PathBuf {
+    std::env::var("SCRIPTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| app_root().join("scripts"))
+}
+
+fn printer_dir() -> PathBuf {
+    std::env::var("PRINTER_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| app_root().join("printer"))
+}
+
+fn static_dir() -> PathBuf {
+    std::env::var("STATIC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| app_root().join("frontend").join("dist"))
 }
 
 fn safe_template_id(name: &str) -> String {
@@ -130,7 +162,11 @@ fn safe_template_id(name: &str) -> String {
         }
     }
     let id = id.trim_matches('-').to_string();
-    if id.is_empty() { "template".to_string() } else { id }
+    if id.is_empty() {
+        "template".to_string()
+    } else {
+        id
+    }
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -138,14 +174,100 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn list_printers() -> Json<serde_json::Value> {
+    let script = r#"
+$printers = Get-Printer | Select-Object Name,DriverName,PortName,PrinterStatus,WorkOffline
+$wmiPrinters = Get-CimInstance Win32_Printer | Group-Object -Property Name -AsHashTable -AsString
+$ports = Get-PrinterPort | Group-Object -Property Name -AsHashTable -AsString
+$pnpDevices = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
+    $_.Status -eq 'OK' -and (
+        $_.Name -match 'Brother|Zebra|Epson|Seiko|Label|QL-|ZD|GK|ZT|LP|TLP' -or
+        $_.Manufacturer -match 'Brother|Zebra|Epson|Seiko' -or
+        $_.DeviceID -match 'USBPRINT|VID_04F9'
+    )
+}
+$result = @()
+foreach ($printer in $printers) {
+    $wmi = $wmiPrinters[$printer.Name]
+    $port = $ports[$printer.PortName]
+    $hostAddress = $null
+    if ($port) {
+        $hostAddress = $port.PrinterHostAddress
+        if ([string]::IsNullOrWhiteSpace($hostAddress)) { $hostAddress = $port.HostAddress }
+    }
+
+    $networkReachable = $null
+    if (-not [string]::IsNullOrWhiteSpace($hostAddress)) {
+        try {
+            $networkReachable = Test-Connection -ComputerName $hostAddress -Count 1 -Quiet -ErrorAction SilentlyContinue
+        } catch {
+            $networkReachable = $false
+        }
+    }
+
+    $detectedErrorState = if ($wmi) { [int]$wmi.DetectedErrorState } else { $null }
+    $wmiPrinterStatus = if ($wmi) { [int]$wmi.PrinterStatus } else { $null }
+    $workOffline = [bool]$printer.WorkOffline
+    $hasOfflineError = $detectedErrorState -eq 9 -or $wmiPrinterStatus -eq 7
+    $hasHardError = $detectedErrorState -in @(4,5,6,7,8,9,10,11)
+
+    $isLabelPrinter = "$($printer.Name) $($printer.DriverName)" -match 'Brother|Zebra|Epson|Seiko|Label|QL-|ZD|GK|ZT|LP|TLP'
+    $isLocalHardwarePort = [string]::IsNullOrWhiteSpace($hostAddress) -and ($printer.PortName -match 'USB|BRUSB|LPT|COM|DOT4|WSD')
+    $localDevicePresent = $null
+    if ($isLabelPrinter -and $isLocalHardwarePort) {
+        $tokens = @()
+        if ("$($printer.Name) $($printer.DriverName)" -match 'Brother') { $tokens += 'Brother'; $tokens += 'VID_04F9' }
+        if ("$($printer.Name) $($printer.DriverName)" -match 'Zebra') { $tokens += 'Zebra' }
+        if ("$($printer.Name) $($printer.DriverName)" -match 'Epson|Seiko') { $tokens += 'Epson'; $tokens += 'Seiko' }
+        if ("$($printer.Name) $($printer.DriverName)" -match 'QL-?820') { $tokens += 'QL-?820' }
+        elseif ("$($printer.Name) $($printer.DriverName)" -match 'QL') { $tokens += 'QL' }
+        if ($tokens.Count -gt 0) {
+            $localDevicePresent = $false
+            foreach ($device in $pnpDevices) {
+                $haystack = "$($device.Name) $($device.Manufacturer) $($device.DeviceID)"
+                foreach ($token in $tokens) {
+                    if ($haystack -match $token) { $localDevicePresent = $true }
+                }
+            }
+        }
+    }
+
+    $isOnline = -not $workOffline -and -not $hasOfflineError -and -not ($networkReachable -eq $false) -and -not ($localDevicePresent -eq $false)
+
+    $statusDetail = 'Ready'
+    if ($workOffline) { $statusDetail = 'Windows offline mode' }
+    elseif ($networkReachable -eq $false) { $statusDetail = 'Network printer not reachable' }
+    elseif ($localDevicePresent -eq $false) { $statusDetail = 'Local printer device not detected' }
+    elseif ($detectedErrorState -eq 4) { $statusDetail = 'No paper' }
+    elseif ($detectedErrorState -eq 5) { $statusDetail = 'Low toner/media' }
+    elseif ($detectedErrorState -eq 6) { $statusDetail = 'No toner/media' }
+    elseif ($detectedErrorState -eq 7) { $statusDetail = 'Door open' }
+    elseif ($detectedErrorState -eq 8) { $statusDetail = 'Paper/media jam' }
+    elseif ($detectedErrorState -eq 9) { $statusDetail = 'Offline' }
+    elseif ($detectedErrorState -eq 10) { $statusDetail = 'Service requested' }
+    elseif ($detectedErrorState -eq 11) { $statusDetail = 'Output bin full' }
+    elseif ($hasHardError) { $statusDetail = 'Printer error' }
+
+    $result += [ordered]@{
+        Name = $printer.Name
+        DriverName = $printer.DriverName
+        PortName = $printer.PortName
+        PrinterStatus = $printer.PrinterStatus.ToString()
+        WorkOffline = $workOffline
+        WmiPrinterStatus = $wmiPrinterStatus
+        DetectedErrorState = $detectedErrorState
+        ExtendedPrinterStatus = if ($wmi) { $wmi.ExtendedPrinterStatus } else { $null }
+        PortHostAddress = $hostAddress
+        NetworkReachable = $networkReachable
+        LocalDevicePresent = $localDevicePresent
+        IsOnline = $isOnline
+        StatusDetail = $statusDetail
+    }
+}
+$result | ConvertTo-Json -Depth 10
+"#;
+
     let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "Get-Printer | Select-Object Name,DriverName,PortName,PrinterStatus,WorkOffline | ConvertTo-Json -Depth 10",
-        ])
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
         .output();
 
     match output {
@@ -163,7 +285,9 @@ async fn list_printers() -> Json<serde_json::Value> {
     }
 }
 
-async fn list_printer_media(Query(params): Query<HashMap<String, String>>) -> Json<serde_json::Value> {
+async fn list_printer_media(
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
     let printer_name = params.get("printer_name").cloned().unwrap_or_default();
     let script = r#"
 Add-Type -AssemblyName System.Drawing
@@ -212,7 +336,9 @@ foreach ($p in $settings.PaperSizes) {
     }
 }
 
-async fn list_print_queue(Query(params): Query<HashMap<String, String>>) -> Json<serde_json::Value> {
+async fn list_print_queue(
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
     let printer_name = params.get("printer_name").cloned().unwrap_or_default();
     let script = r#"
 $printer = $env:PRINTER_NAME
@@ -284,7 +410,9 @@ foreach ($job in $jobs) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             serde_json::from_str::<serde_json::Value>(&stdout)
                 .map(Json)
-                .unwrap_or_else(|_| Json(serde_json::json!({ "status": "ok", "stdout": stdout.trim() })))
+                .unwrap_or_else(|_| {
+                    Json(serde_json::json!({ "status": "ok", "stdout": stdout.trim() }))
+                })
         }
         Ok(output) => Json(serde_json::json!({
             "status": "error",
@@ -295,10 +423,7 @@ foreach ($job in $jobs) {
 }
 
 fn launch_driver_tool(file_name: &str, action: &str) -> Json<serde_json::Value> {
-    let tool_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("printer")
-        .join(file_name);
+    let tool_path = printer_dir().join(file_name);
 
     if !tool_path.exists() {
         return Json(serde_json::json!({
@@ -329,7 +454,9 @@ Start-Process -FilePath $tool -Verb RunAs
             let stdout = String::from_utf8_lossy(&output.stdout);
             serde_json::from_str::<serde_json::Value>(&stdout)
                 .map(Json)
-                .unwrap_or_else(|_| Json(serde_json::json!({ "status": "launched", "stdout": stdout.trim() })))
+                .unwrap_or_else(|_| {
+                    Json(serde_json::json!({ "status": "launched", "stdout": stdout.trim() }))
+                })
         }
         Ok(output) => Json(serde_json::json!({
             "status": "error",
@@ -363,14 +490,19 @@ async fn list_templates() -> Json<serde_json::Value> {
                 }
                 if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) {
-                        let id = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+                        let id = path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or_default();
                         value["id"] = serde_json::json!(id);
                         templates.push(value);
                     }
                 }
             }
         }
-        Err(error) => return Json(serde_json::json!({ "status": "error", "error": error.to_string() })),
+        Err(error) => {
+            return Json(serde_json::json!({ "status": "error", "error": error.to_string() }));
+        }
     }
 
     Json(serde_json::json!({ "status": "ok", "templates": templates }))
@@ -391,7 +523,10 @@ async fn save_template(Json(payload): Json<SaveTemplateRequest>) -> Json<serde_j
         "label": payload.label
     });
 
-    match serde_json::to_string_pretty(&value).ok().and_then(|text| fs::write(&path, text).ok()) {
+    match serde_json::to_string_pretty(&value)
+        .ok()
+        .and_then(|text| fs::write(&path, text).ok())
+    {
         Some(_) => Json(serde_json::json!({ "status": "ok", "template": value })),
         None => Json(serde_json::json!({ "status": "error", "error": "Could not save template" })),
     }
@@ -402,15 +537,15 @@ async fn delete_template(Path(id): Path<String>) -> Json<serde_json::Value> {
     let path = templates_dir().join(format!("{safe_id}.json"));
     match fs::remove_file(&path) {
         Ok(_) => Json(serde_json::json!({ "status": "ok", "deleted": safe_id })),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Json(serde_json::json!({ "status": "ok", "deleted": safe_id })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Json(serde_json::json!({ "status": "ok", "deleted": safe_id }))
+        }
         Err(error) => Json(serde_json::json!({ "status": "error", "error": error.to_string() })),
     }
 }
 
 fn print_label(payload: &LabelRequest) -> serde_json::Value {
-    let scripts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("scripts");
+    let scripts_dir = scripts_dir();
     let script_path = scripts_dir.join("print_label.ps1");
     let brother_ql_script_path = scripts_dir.join("print_label_brother_ql.py");
 
@@ -553,6 +688,10 @@ async fn create_label(Json(payload): Json<LabelRequest>) -> Json<serde_json::Val
 
 #[tokio::main]
 async fn main() {
+    let static_path = static_dir();
+    let static_service =
+        ServeDir::new(&static_path).fallback(ServeFile::new(static_path.join("index.html")));
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/printers", get(list_printers))
@@ -564,10 +703,15 @@ async fn main() {
         .route("/templates", get(list_templates).post(save_template))
         .route("/templates/:id", delete(delete_template))
         .route("/label", post(create_label))
+        .nest_service("/", static_service)
         .layer(CorsLayer::permissive());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 9000));
-    println!("Backend running on http://localhost:9000");
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(9000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    println!("LabelsControlPro running on http://0.0.0.0:{port}");
 
     axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app)
         .await

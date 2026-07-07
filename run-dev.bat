@@ -21,12 +21,13 @@ if errorlevel 1 (
 )
 
 start "Product Label Backend - Rust" cmd /k "cd /d "%ROOT%backend" && cargo run"
-start "Product Label Frontend - Vue" cmd /k "cd /d "%ROOT%frontend" && npm run dev -- --host 0.0.0.0"
+start "Product Label Frontend - Vue" cmd /k "cd /d "%ROOT%frontend" && set VITE_API_BASE=http://localhost:9000&& npm run dev -- --host 0.0.0.0"
 
-echo Backend:  http://localhost:9000
-echo Frontend: http://localhost:5173
+echo Backend/API:  http://localhost:9000
+echo Frontend dev: http://localhost:5173
 echo.
 echo Two app windows were started. Close those windows to stop servers.
+echo For production Windows builds, run build-windows.bat.
 echo.
 timeout /t 3 >nul
 start "" "http://localhost:5173"

@@ -7,8 +7,9 @@ Local Windows web app for creating product labels and printing them to a Brother
 Stack:
 
 - Backend: Rust + Axum on `http://localhost:9000`
-- Frontend: Vue 3 + Vite on `http://localhost:5173`
-- Printing bridge: Windows PowerShell script using installed Windows printers
+- Frontend dev server: Vue 3 + Vite on `http://localhost:5173`
+- Production Windows build: single `LabelsControlPro.exe` serving both API and frontend on `http://localhost:9000`
+- Printing bridge: Windows PowerShell/Python scripts using installed Windows printers
 
 Current UI supports:
 
@@ -27,7 +28,23 @@ Current UI supports:
 
 ## How to run
 
-Preferred dev startup:
+### Local single-port Windows run
+
+Use this when you want the app to behave like the production Windows app without creating a packaged build:
+
+```bat
+run-local.bat
+```
+
+This builds the frontend, starts the Rust backend, serves the UI and API together, and opens:
+
+```text
+http://localhost:9000
+```
+
+### Development with hot reload
+
+Preferred dev startup while editing frontend code:
 
 ```bat
 run-dev.bat
@@ -53,6 +70,25 @@ Open:
 http://localhost:5173
 ```
 
+### Windows production build
+
+```bat
+build-windows.bat
+```
+
+This creates:
+
+```text
+dist-windows\LabelsControlPro.exe
+dist-windows\Start-LabelsControlPro.bat
+```
+
+Run `dist-windows\Start-LabelsControlPro.bat`, then open:
+
+```text
+http://localhost:9000
+```
+
 ## Main files
 
 ```text
@@ -60,7 +96,10 @@ backend/src/main.rs              Rust API, printer listing, print endpoint
 frontend/src/App.vue             Main Vue app and UI logic
 frontend/src/style.css           Dark industrial theme and label preview styling
 scripts/print_label.ps1          Windows printing bridge
-run-dev.bat                      One-click dev launcher
+run-local.bat                    One-click single-port local Windows launcher
+run-dev.bat                      One-click dev launcher with frontend hot reload
+build-windows.bat                One-click Windows production build launcher
+scripts/build-windows.ps1        Windows build/package script
 ```
 
 ## API
@@ -101,6 +140,7 @@ Done:
 - Rust Axum backend works
 - Vue 3 frontend works
 - CORS configured
+- Backend serves built frontend for single-app Windows production builds
 - Printer list endpoint added
 - Windows print bridge added
 - One-click `run-dev.bat` added
@@ -129,7 +169,7 @@ Priority order:
 5. Apply real print density, cut mode, label length, and quality settings.
 6. Add real barcode/QR generation instead of visual placeholder bars.
 7. Optional later: Ollama label text/template generation.
-8. Optional later: Docker/dev packaging.
+8. Optional later: Windows installer/service packaging.
 
 ## How to continue with an AI coding agent
 

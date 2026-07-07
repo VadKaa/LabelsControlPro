@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 
-type LayoutFieldKey = 'product_number' | 'product_name' | 'barcode' | 'qr_code' | 'details' | 'notes'
+type LayoutFieldKey = 'product_number' | 'product_name' | 'barcode' | 'qr_code' | 'item_type' | 'weight' | 'quantity' | 'details' | 'notes'
 
 type LayoutOffset = {
   x: number
@@ -25,6 +25,15 @@ type DisplayOptions = {
   weight: boolean
   notes: boolean
 }
+
+type LayoutAnchor = {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+type LayoutAnchors = Record<LayoutFieldKey, LayoutAnchor>
 
 type LabelPayload = {
   product_number: string
@@ -59,6 +68,14 @@ type Printer = {
   PortName: string
   PrinterStatus?: string | number
   WorkOffline?: boolean
+  WmiPrinterStatus?: number | null
+  DetectedErrorState?: number | null
+  ExtendedPrinterStatus?: number | null
+  PortHostAddress?: string | null
+  NetworkReachable?: boolean | null
+  LocalDevicePresent?: boolean | null
+  IsOnline?: boolean
+  StatusDetail?: string
 }
 
 type PrintJob = {
@@ -87,7 +104,7 @@ type PrinterMedia = {
   continuous: boolean
 }
 
-const API_BASE = 'http://localhost:9000'
+const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 const form = reactive<LabelPayload>({
   product_number: 'BR-99042-X',
@@ -124,6 +141,9 @@ const form = reactive<LabelPayload>({
     product_name: { family: 'Arial', size: 14, bold: true, italic: false },
     barcode: { family: 'Consolas', size: 8, bold: true, italic: false },
     qr_code: { family: 'Arial', size: 9, bold: false, italic: false },
+    item_type: { family: 'Arial', size: 9, bold: false, italic: false },
+    weight: { family: 'Arial', size: 9, bold: false, italic: false },
+    quantity: { family: 'Arial', size: 9, bold: false, italic: false },
     details: { family: 'Arial', size: 9, bold: false, italic: false },
     notes: { family: 'Arial', size: 9, bold: false, italic: false },
   },
@@ -132,6 +152,9 @@ const form = reactive<LabelPayload>({
     product_name: { x: 0, y: 0, scale: 1 },
     barcode: { x: 0, y: 0, scale: 1 },
     qr_code: { x: 0, y: 0, scale: 1 },
+    item_type: { x: 0, y: 0, scale: 1 },
+    weight: { x: 0, y: 0, scale: 1 },
+    quantity: { x: 0, y: 0, scale: 1 },
     details: { x: 0, y: 0, scale: 1 },
     notes: { x: 0, y: 0, scale: 1 },
   },
@@ -164,19 +187,23 @@ const layoutFields: Array<{ key: LayoutFieldKey; label: string }> = [
   { key: 'product_name', label: 'Product Name' },
   { key: 'barcode', label: 'Barcode' },
   { key: 'qr_code', label: 'QR Code' },
-  { key: 'details', label: 'Qty / Type / Weight' },
+  { key: 'item_type', label: 'Item Type' },
+  { key: 'weight', label: 'Weight' },
+  { key: 'quantity', label: 'Quantity' },
+  { key: 'details', label: 'Details Group' },
   { key: 'notes', label: 'Notes' },
 ]
 
 const selectedPrinter = computed(() => printers.value.find((printer) => printer.Name === form.printer_name))
 const brotherInstalled = computed(() => printers.value.some((printer) => printer.Name.toLowerCase().includes('brother') || printer.DriverName.toLowerCase().includes('brother')))
 const printerOnline = computed(() => {
-  if (!selectedPrinter.value && !form.printer_name) return printers.value.length > 0
+  if (!selectedPrinter.value && !form.printer_name) return printers.value.some((printer) => printer.IsOnline ?? !printer.WorkOffline)
   if (!selectedPrinter.value) return false
+  if (typeof selectedPrinter.value.IsOnline === 'boolean') return selectedPrinter.value.IsOnline
   return !selectedPrinter.value.WorkOffline
 })
-const statusLabel = computed(() => printerOnline.value ? 'ONLINE' : 'OFFLINE')
-const statusClass = computed(() => printerOnline.value ? 'online' : 'offline')
+const statusLabel = computed(() => printerLoading.value ? 'SCANNING' : printerOnline.value ? 'ONLINE' : 'OFFLINE')
+const statusClass = computed(() => printerLoading.value ? 'scanning' : printerOnline.value ? 'online' : 'offline')
 const printerProfiles = [
   { id: 'brother_ql_raster', name: 'Brother QL Raster Direct', status: 'Recommended', note: 'Bypasses Windows layout/scaling by sending Brother QL raster commands through the Windows RAW queue. Use this for QL-820NWB to avoid Windows media-size mismatch.' },
   { id: 'brother_ql_windows', name: 'Brother QL via Windows Driver', status: 'Legacy', note: 'Uses the Windows/Brother driver. Can be affected by Windows Printing Preferences and media mismatch.' },
@@ -240,7 +267,7 @@ const labelTapeStyle = computed(() => {
     width: `${previewSize.value.width}px`,
     height: `${previewSize.value.height}px`,
     minHeight: `${previewSize.value.height}px`,
-    gridTemplateColumns: isVertical || ['stacked', 'barcode_bottom', 'minimal'].includes(form.layout_preset) ? '1fr' : 'minmax(0, 58fr) 42fr',
+    gridTemplateColumns: isVertical || ['stacked', 'barcode_bottom'].includes(form.layout_preset) ? '1fr' : 'minmax(0, 58fr) 42fr',
     '--barcode-height': `${barcodeHeightPx.value}px`,
   }
 })
@@ -269,8 +296,69 @@ function objectStyle(field: LayoutFieldKey, xMm: number, yMm: number, widthMm: n
   }
 }
 
-const barcodeObjectStyle = computed(() => objectStyle('barcode', 13, 43, 32, 11))
-const qrObjectStyle = computed(() => objectStyle('qr_code', 48, 5, 10, 10))
+const layoutAnchors = computed<LayoutAnchors>(() => {
+  const length = form.print_orientation === 'vertical' ? form.label_width_mm : form.label_length_mm
+  const width = form.print_orientation === 'vertical' ? form.label_length_mm : form.label_width_mm
+  const rightQrX = Math.max(4, length - 14)
+  const bottomBarcodeY = Math.max(18, width - 18)
+
+  const presets: Record<string, LayoutAnchors> = {
+    compact_right: {
+      product_number: { x: 4, y: 5, w: 20, h: 7 },
+      product_name: { x: 4, y: Math.max(38, width - 10), w: Math.max(24, length - 22), h: 7 },
+      details: { x: 4, y: 24, w: Math.max(28, length * 0.52), h: 12 },
+      item_type: { x: 4, y: 24, w: Math.max(10, length * 0.18), h: 12 },
+      weight: { x: Math.max(14, length * 0.22), y: 24, w: Math.max(10, length * 0.14), h: 12 },
+      quantity: { x: Math.max(24, length * 0.36), y: 24, w: Math.max(8, length * 0.10), h: 12 },
+      notes: { x: Math.max(30, length * 0.55), y: 24, w: Math.max(26, length * 0.40), h: 14 },
+      barcode: { x: Math.max(10, length * 0.22), y: Math.max(34, width - 19), w: Math.max(28, length * 0.54), h: 11 },
+      qr_code: { x: rightQrX, y: 5, w: 10, h: 10 },
+    },
+    barcode_left: {
+      product_number: { x: Math.max(24, length * 0.42), y: 5, w: 24, h: 7 },
+      product_name: { x: Math.max(24, length * 0.42), y: Math.max(38, width - 10), w: Math.max(22, length * 0.50), h: 7 },
+      details: { x: Math.max(24, length * 0.42), y: 24, w: Math.max(28, length * 0.44), h: 12 },
+      item_type: { x: Math.max(24, length * 0.42), y: 24, w: Math.max(10, length * 0.16), h: 12 },
+      weight: { x: Math.max(34, length * 0.56), y: 24, w: Math.max(10, length * 0.14), h: 12 },
+      quantity: { x: Math.max(44, length * 0.70), y: 24, w: Math.max(8, length * 0.10), h: 12 },
+      notes: { x: Math.max(36, length * 0.58), y: 36, w: Math.max(24, length * 0.38), h: 14 },
+      barcode: { x: 4, y: 20, w: Math.max(20, length * 0.35), h: 11 },
+      qr_code: { x: 4, y: Math.max(40, width - 18), w: 10, h: 10 },
+    },
+    stacked: {
+      product_number: { x: 4, y: 5, w: Math.max(24, length * 0.42), h: 7 },
+      product_name: { x: 4, y: 14, w: Math.max(34, length * 0.70), h: 7 },
+      details: { x: 4, y: 25, w: Math.max(32, length * 0.52), h: 12 },
+      item_type: { x: 4, y: 25, w: Math.max(10, length * 0.18), h: 12 },
+      weight: { x: Math.max(14, length * 0.22), y: 25, w: Math.max(10, length * 0.14), h: 12 },
+      quantity: { x: Math.max(24, length * 0.36), y: 25, w: Math.max(8, length * 0.10), h: 12 },
+      notes: { x: Math.max(30, length * 0.54), y: 25, w: Math.max(26, length * 0.40), h: 14 },
+      barcode: { x: Math.max(4, length * 0.18), y: Math.max(39, width - 20), w: Math.max(34, length * 0.62), h: 11 },
+      qr_code: { x: rightQrX, y: 5, w: 10, h: 10 },
+    },
+    barcode_bottom: {
+      product_number: { x: 4, y: 5, w: Math.max(24, length * 0.42), h: 7 },
+      product_name: { x: 4, y: 14, w: Math.max(34, length * 0.70), h: 7 },
+      details: { x: 4, y: 25, w: Math.max(32, length * 0.52), h: 12 },
+      item_type: { x: 4, y: 25, w: Math.max(10, length * 0.18), h: 12 },
+      weight: { x: Math.max(14, length * 0.22), y: 25, w: Math.max(10, length * 0.14), h: 12 },
+      quantity: { x: Math.max(24, length * 0.36), y: 25, w: Math.max(8, length * 0.10), h: 12 },
+      notes: { x: Math.max(30, length * 0.54), y: 25, w: Math.max(26, length * 0.40), h: 14 },
+      barcode: { x: 4, y: bottomBarcodeY, w: Math.max(44, length - 8), h: 11 },
+      qr_code: { x: rightQrX, y: 5, w: 10, h: 10 },
+    },
+  }
+
+  return presets[form.layout_preset] || presets.compact_right
+})
+const barcodeObjectStyle = computed(() => {
+  const anchor = layoutAnchors.value.barcode
+  return objectStyle('barcode', anchor.x, anchor.y, anchor.w, anchor.h)
+})
+const qrObjectStyle = computed(() => {
+  const anchor = layoutAnchors.value.qr_code
+  return objectStyle('qr_code', anchor.x, anchor.y, anchor.w, anchor.h)
+})
 
 const barcodeStyle = computed(() => ({
   height: `${barcodeHeightPx.value}px`,
@@ -605,8 +693,11 @@ async function generatePreviewImageDataUrl() {
   const sy = previewScale.value.y * scale
   const px = (mm: number) => mm * sx
   const py = (mm: number) => mm * sy
-  const fieldX = (field: LayoutFieldKey, base: number) => px(base + form.layout_offsets[field].x)
-  const fieldY = (field: LayoutFieldKey, base: number) => py(base + form.layout_offsets[field].y)
+  const anchor = layoutAnchors.value
+  const fieldX = (field: LayoutFieldKey) => px(anchor[field].x + form.layout_offsets[field].x)
+  const fieldY = (field: LayoutFieldKey) => py(anchor[field].y + form.layout_offsets[field].y)
+  const fieldW = (field: LayoutFieldKey) => px(anchor[field].w)
+  const fieldH = (field: LayoutFieldKey) => py(anchor[field].h)
 
   function applyFont(field: LayoutFieldKey, fallbackSize: number) {
     const font = form.font_settings[field]
@@ -633,41 +724,47 @@ async function generatePreviewImageDataUrl() {
   ctx.fillRect(0, 0, width, height)
 
   if (form.display_options.product_number) {
-    clipText(form.product_number || 'SKU-000', fieldX('product_number', 4), fieldY('product_number', 5), px(24), py(8), 'product_number', 27)
+    clipText(form.product_number || 'SKU-000', fieldX('product_number'), fieldY('product_number'), fieldW('product_number'), fieldH('product_number'), 'product_number', 27)
   }
   if (form.display_options.product_name) {
-    clipText(form.product_name || 'Product name', fieldX('product_name', 4), fieldY('product_name', 52), px(40), py(8), 'product_name', 14)
+    clipText(form.product_name || 'Product name', fieldX('product_name'), fieldY('product_name'), fieldW('product_name'), fieldH('product_name'), 'product_name', 14)
   }
 
-  applyFont('details', 9)
-  const detailsY = fieldY('details', 24)
-  const detailsX = fieldX('details', 4)
-  const col = px(12)
   if (form.display_options.item_type) {
-    ctx.fillText('ITEM TYPE', detailsX, detailsY)
-    ctx.fillText(form.item_type || 'TYPE', detailsX, detailsY + py(4))
+    applyFont('item_type', 9)
+    const x = fieldX('item_type')
+    const y = fieldY('item_type')
+    ctx.fillText('ITEM TYPE', x, y)
+    ctx.fillText(form.item_type || 'TYPE', x, y + py(4))
   }
   if (form.display_options.weight) {
-    ctx.fillText('WEIGHT', detailsX + col, detailsY)
-    ctx.fillText(form.weight || '0 KG', detailsX + col, detailsY + py(4))
+    applyFont('weight', 9)
+    const x = fieldX('weight')
+    const y = fieldY('weight')
+    ctx.fillText('WEIGHT', x, y)
+    ctx.fillText(form.weight || '0 KG', x, y + py(4))
   }
   if (form.display_options.quantity) {
-    ctx.fillText('QTY', detailsX + col * 2, detailsY)
-    ctx.fillText(String(form.quantity), detailsX + col * 2, detailsY + py(4))
+    applyFont('quantity', 9)
+    const x = fieldX('quantity')
+    const y = fieldY('quantity')
+    ctx.fillText('QTY', x, y)
+    ctx.fillText(String(form.quantity), x, y + py(4))
   }
 
   if (form.display_options.notes) {
     applyFont('notes', 9)
-    const nx = fieldX('notes', 40)
-    const ny = fieldY('notes', 24)
+    const nx = fieldX('notes')
+    const ny = fieldY('notes')
     ctx.fillText('NOTES', nx, ny)
-    ctx.fillText(form.notes || 'NONE', nx, ny + py(4))
+    const noteLines = (form.notes || 'NONE').split('\n').slice(0, 3)
+    noteLines.forEach((line, index) => ctx.fillText(line, nx, ny + py(4 + index * 4)))
   }
 
   if (form.display_options.barcode) {
-    const bx = fieldX('barcode', 13)
-    const by = fieldY('barcode', 43)
-    const bw = px(32) * form.layout_offsets.barcode.scale
+    const bx = fieldX('barcode')
+    const by = fieldY('barcode')
+    const bw = fieldW('barcode') * form.layout_offsets.barcode.scale
     const bh = barcodeHeightPx.value * scale * form.layout_offsets.barcode.scale
     const total = barcodeBars.value.reduce((sum, bar) => sum + bar, 0)
     let x = bx
@@ -684,9 +781,9 @@ async function generatePreviewImageDataUrl() {
   }
 
   if (form.show_qr) {
-    const qx = fieldX('qr_code', 48)
-    const qy = fieldY('qr_code', 5)
-    const cell = Math.max(1, px(0.75) * form.layout_offsets.qr_code.scale)
+    const qx = fieldX('qr_code')
+    const qy = fieldY('qr_code')
+    const cell = Math.max(1, fieldW('qr_code') / 13 * form.layout_offsets.qr_code.scale)
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(qx, qy, cell * 13, cell * 13)
     ctx.fillStyle = '#020617'
@@ -804,11 +901,12 @@ onUnmounted(() => {
         <div class="meter"><span :style="{ width: `${printProgressPercent}%` }"></span></div>
         <small>{{ printProgressLabel }}</small>
         <small>{{ selectedPrinter?.Name || 'No printer selected' }}</small>
+        <small v-if="selectedPrinter">{{ selectedPrinter.StatusDetail || selectedPrinter.PrinterStatus }}</small>
         <small v-if="!brotherInstalled" class="warn">Brother printer not detected in Windows</small>
       </div>
     </aside>
 
-    <main class="workbench">
+    <main class="workbench" :class="{ 'designer-workbench': activeTab === 'designer' }">
       <section v-if="activeTab === 'designer'" class="panel form-panel">
         <div class="panel-head">
           <h1>Parameters</h1>
@@ -906,7 +1004,6 @@ onUnmounted(() => {
                   <option value="barcode_left">Compact: barcode left</option>
                   <option value="stacked">Stacked: barcode under title</option>
                   <option value="barcode_bottom">Wide: full-width barcode</option>
-                  <option value="minimal">Minimal: SKU + barcode only</option>
                 </select>
               </label>
             </div>
@@ -974,7 +1071,7 @@ onUnmounted(() => {
               <select v-model="form.printer_name" @change="loadPrinterMedia">
                 <option value="">Use default printer</option>
                 <option v-for="printer in printers" :key="printer.Name" :value="printer.Name">
-                  {{ printer.Name }} / {{ printer.DriverName }}
+                  {{ printer.Name }} / {{ printer.DriverName }} / {{ printer.StatusDetail || printer.PrinterStatus }}
                 </option>
               </select>
             </label>
@@ -1017,7 +1114,7 @@ onUnmounted(() => {
               v-if="form.display_options.product_number"
               class="label-object sku draggable-field"
               :class="{ selected: selectedLayoutField === 'product_number' }"
-              :style="objectStyle('product_number', 4, 5, 20, 7)"
+              :style="objectStyle('product_number', layoutAnchors.product_number.x, layoutAnchors.product_number.y, layoutAnchors.product_number.w, layoutAnchors.product_number.h)"
               @pointerdown.stop.prevent="startDrag('product_number', $event)"
             >{{ form.product_number || 'SKU-000' }}</div>
 
@@ -1025,35 +1122,45 @@ onUnmounted(() => {
               v-if="form.display_options.product_name"
               class="label-object product draggable-field"
               :class="{ selected: selectedLayoutField === 'product_name' }"
-              :style="objectStyle('product_name', 4, 52, 38, 7)"
+              :style="objectStyle('product_name', layoutAnchors.product_name.x, layoutAnchors.product_name.y, layoutAnchors.product_name.w, layoutAnchors.product_name.h)"
               @pointerdown.stop.prevent="startDrag('product_name', $event)"
             >{{ form.product_name || 'Product name' }}</div>
 
             <div
-              class="label-object label-data absolute-data draggable-field"
-              :class="{ selected: selectedLayoutField === 'details' }"
-              :style="objectStyle('details', 4, 24, 34, 12)"
-              @pointerdown.stop.prevent="startDrag('details', $event)"
+              v-if="form.display_options.item_type"
+              class="label-object label-data single-field draggable-field"
+              :class="{ selected: selectedLayoutField === 'item_type' }"
+              :style="objectStyle('item_type', layoutAnchors.item_type.x, layoutAnchors.item_type.y, layoutAnchors.item_type.w, layoutAnchors.item_type.h)"
+              @pointerdown.stop.prevent="startDrag('item_type', $event)"
             >
-              <div v-if="form.display_options.item_type">
-                <span>ITEM TYPE</span>
-                <strong>{{ form.item_type || 'TYPE' }}</strong>
-              </div>
-              <div v-if="form.display_options.weight">
-                <span>WEIGHT</span>
-                <strong>{{ form.weight || '0 KG' }}</strong>
-              </div>
-              <div v-if="form.display_options.quantity">
-                <span>QTY</span>
-                <strong>{{ form.quantity }}</strong>
-              </div>
+              <div><span>ITEM TYPE</span><strong>{{ form.item_type || 'TYPE' }}</strong></div>
+            </div>
+
+            <div
+              v-if="form.display_options.weight"
+              class="label-object label-data single-field draggable-field"
+              :class="{ selected: selectedLayoutField === 'weight' }"
+              :style="objectStyle('weight', layoutAnchors.weight.x, layoutAnchors.weight.y, layoutAnchors.weight.w, layoutAnchors.weight.h)"
+              @pointerdown.stop.prevent="startDrag('weight', $event)"
+            >
+              <div><span>WEIGHT</span><strong>{{ form.weight || '0 KG' }}</strong></div>
+            </div>
+
+            <div
+              v-if="form.display_options.quantity"
+              class="label-object label-data single-field draggable-field"
+              :class="{ selected: selectedLayoutField === 'quantity' }"
+              :style="objectStyle('quantity', layoutAnchors.quantity.x, layoutAnchors.quantity.y, layoutAnchors.quantity.w, layoutAnchors.quantity.h)"
+              @pointerdown.stop.prevent="startDrag('quantity', $event)"
+            >
+              <div><span>QTY</span><strong>{{ form.quantity }}</strong></div>
             </div>
 
             <div
               v-if="form.display_options.notes"
               class="label-object label-data notes-object draggable-field"
               :class="{ selected: selectedLayoutField === 'notes' }"
-              :style="objectStyle('notes', 40, 24, 16, 12)"
+              :style="objectStyle('notes', layoutAnchors.notes.x, layoutAnchors.notes.y, layoutAnchors.notes.w, layoutAnchors.notes.h)"
               @pointerdown.stop.prevent="startDrag('notes', $event)"
             >
               <div>
@@ -1200,6 +1307,9 @@ onUnmounted(() => {
             <span>{{ printer.PortName }}</span>
             <strong>{{ printer.Name }}</strong>
             <small>{{ printer.DriverName }}</small>
+            <small>{{ printer.StatusDetail || printer.PrinterStatus }}</small>
+            <small v-if="printer.PortHostAddress">{{ printer.PortHostAddress }} / {{ printer.NetworkReachable === false ? 'not reachable' : 'reachable' }}</small>
+            <small v-else-if="printer.LocalDevicePresent !== null && printer.LocalDevicePresent !== undefined">Local device: {{ printer.LocalDevicePresent ? 'detected' : 'not detected' }}</small>
           </div>
         </div>
 
