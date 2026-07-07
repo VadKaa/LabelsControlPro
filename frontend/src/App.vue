@@ -164,7 +164,7 @@ const printers = ref<Printer[]>([])
 const printJobs = ref<PrintJob[]>([])
 const templates = ref<LabelTemplate[]>([])
 const printerMedia = ref<PrinterMedia[]>([])
-const activeTab = ref<'designer' | 'queue' | 'hardware' | 'templates'>('designer')
+const activeTab = ref<'designer' | 'queue' | 'hardware' | 'templates' | 'appearance'>('designer')
 const loading = ref(false)
 const printerLoading = ref(false)
 const queueLoading = ref(false)
@@ -182,6 +182,18 @@ const gridSize = ref(5)
 const selectedLayoutField = ref<LayoutFieldKey>('barcode')
 const dragState = ref<{ field: LayoutFieldKey; startX: number; startY: number; originX: number; originY: number } | null>(null)
 const fontFamilies = ['Arial', 'Helvetica', 'Times New Roman', 'sans-serif', 'serif', 'monospace', 'Consolas', 'Courier New', 'Verdana', 'Tahoma', 'Trebuchet MS', 'Georgia']
+const colorThemes = [
+  { id: 'industrial', name: 'Industrial Blue', note: 'Current dark shop-floor theme', colors: { bg: '#0b1326', surface: '#0f172a', surfaceCard: '#171f33', surfaceHigh: '#222a3d', text: '#dae2fd', muted: '#c5c5d3', line: '#444651', primary: '#b6c4ff', primaryDark: '#1e3a8a', success: '#4edea3', error: '#ffb4ab', warn: '#fbbf24' } },
+  { id: 'windows', name: 'Windows Fluent', note: 'Clean blue Windows-style controls', colors: { bg: '#f3f6fb', surface: '#ffffff', surfaceCard: '#ffffff', surfaceHigh: '#e8eef8', text: '#152033', muted: '#5b677a', line: '#c9d3e5', primary: '#2563eb', primaryDark: '#0f6cbd', success: '#107c10', error: '#c42b1c', warn: '#f59e0b' } },
+  { id: 'graphite', name: 'Graphite Pro', note: 'Neutral dark grey professional UI', colors: { bg: '#111111', surface: '#181818', surfaceCard: '#202020', surfaceHigh: '#2b2b2b', text: '#f4f4f5', muted: '#a1a1aa', line: '#3f3f46', primary: '#d4d4d8', primaryDark: '#3f3f46', success: '#22c55e', error: '#f87171', warn: '#facc15' } },
+  { id: 'forest', name: 'Forest Green', note: 'Dark green production dashboard', colors: { bg: '#07140f', surface: '#0d1f18', surfaceCard: '#132b22', surfaceHigh: '#1f3b31', text: '#e5fff4', muted: '#a7c7b8', line: '#33594a', primary: '#86efac', primaryDark: '#166534', success: '#4ade80', error: '#fb7185', warn: '#fde047' } },
+  { id: 'amber', name: 'Amber Workshop', note: 'Warm high-contrast workshop theme', colors: { bg: '#1c1208', surface: '#24180d', surfaceCard: '#332111', surfaceHigh: '#463018', text: '#fff7ed', muted: '#fed7aa', line: '#7c4a1d', primary: '#fdba74', primaryDark: '#9a3412', success: '#84cc16', error: '#fca5a5', warn: '#fbbf24' } },
+] as const
+
+type ThemeColors = typeof colorThemes[number]['colors']
+type ThemeId = typeof colorThemes[number]['id'] | 'custom'
+const activeTheme = ref<ThemeId>('industrial')
+const customTheme = reactive<ThemeColors>({ ...colorThemes[0].colors })
 const layoutFields: Array<{ key: LayoutFieldKey; label: string }> = [
   { key: 'product_number', label: 'Product Number' },
   { key: 'product_name', label: 'Product Name' },
@@ -212,6 +224,7 @@ const printerProfiles = [
   { id: 'generic_windows', name: 'Generic Windows Printer', status: 'Active', note: 'Fallback path for installed Windows printers using standard driver printing and selected media.' },
 ]
 const selectedProfile = computed(() => printerProfiles.find((profile) => profile.id === form.printer_profile) || printerProfiles[0])
+const selectedThemeColors = computed(() => activeTheme.value === 'custom' ? customTheme : colorThemes.find((theme) => theme.id === activeTheme.value)?.colors || colorThemes[0].colors)
 const selectedMedia = computed(() => `${form.label_width_mm}mm x ${form.label_length_mm}mm`)
 const selectedDriverMedia = computed(() => printerMedia.value.find((media) => media.name === form.driver_media_name))
 const usefulMedia = computed(() => printerMedia.value.filter((media) => media.name.includes('62mm') || media.continuous).slice(0, 30))
@@ -638,7 +651,51 @@ function applyDriverMedia() {
   }
 }
 
-async function openTab(tab: 'designer' | 'queue' | 'hardware' | 'templates') {
+function applyTheme(colors: ThemeColors) {
+  const root = document.documentElement
+  root.style.setProperty('--bg', colors.bg)
+  root.style.setProperty('--surface', colors.surface)
+  root.style.setProperty('--surface-low', colors.surface)
+  root.style.setProperty('--surface-card', colors.surfaceCard)
+  root.style.setProperty('--surface-high', colors.surfaceHigh)
+  root.style.setProperty('--surface-highest', colors.surfaceHigh)
+  root.style.setProperty('--text', colors.text)
+  root.style.setProperty('--muted', colors.muted)
+  root.style.setProperty('--line', colors.line)
+  root.style.setProperty('--line-bright', colors.primary)
+  root.style.setProperty('--primary', colors.primary)
+  root.style.setProperty('--primary-dark', colors.primaryDark)
+  root.style.setProperty('--success', colors.success)
+  root.style.setProperty('--success-bg', colors.surfaceHigh)
+  root.style.setProperty('--error', colors.error)
+  root.style.setProperty('--error-bg', colors.surfaceHigh)
+  root.style.setProperty('--warn', colors.warn)
+}
+
+function selectTheme(themeId: ThemeId) {
+  activeTheme.value = themeId
+  applyTheme(selectedThemeColors.value)
+  localStorage.setItem('labelscontrolpro-theme', JSON.stringify({ activeTheme: activeTheme.value, customTheme }))
+}
+
+function saveCustomTheme() {
+  selectTheme('custom')
+}
+
+function loadSavedTheme() {
+  const saved = localStorage.getItem('labelscontrolpro-theme')
+  if (!saved) return applyTheme(selectedThemeColors.value)
+  try {
+    const parsed = JSON.parse(saved)
+    if (parsed.customTheme) Object.assign(customTheme, parsed.customTheme)
+    if (parsed.activeTheme) activeTheme.value = parsed.activeTheme
+    applyTheme(selectedThemeColors.value)
+  } catch {
+    applyTheme(selectedThemeColors.value)
+  }
+}
+
+async function openTab(tab: 'designer' | 'queue' | 'hardware' | 'templates' | 'appearance') {
   activeTab.value = tab
   if (tab === 'queue') await loadPrintQueue()
   if (tab === 'hardware') {
@@ -849,7 +906,15 @@ async function submitLabel() {
   }
 }
 
+watch(customTheme, () => {
+  if (activeTheme.value === 'custom') {
+    applyTheme(customTheme)
+    localStorage.setItem('labelscontrolpro-theme', JSON.stringify({ activeTheme: activeTheme.value, customTheme }))
+  }
+})
+
 onMounted(async () => {
+  loadSavedTheme()
   await loadPrinters()
   await loadPrinterMedia()
 })
@@ -891,6 +956,7 @@ onUnmounted(() => {
         <button :class="{ active: activeTab === 'queue' }" type="button" @click="openTab('queue')">Print Queue <b v-if="stuckJobs">{{ stuckJobs }}</b></button>
         <button :class="{ active: activeTab === 'hardware' }" type="button" @click="openTab('hardware')">Printer Settings</button>
         <button :class="{ active: activeTab === 'templates' }" type="button" @click="openTab('templates')">Templates <b v-if="newTemplatesCount">{{ newTemplatesCount }}</b></button>
+        <button :class="{ active: activeTab === 'appearance' }" type="button" @click="openTab('appearance')">Appearance</button>
       </nav>
 
       <div class="status-card">
@@ -1205,6 +1271,60 @@ onUnmounted(() => {
           <div>
             <span>LAYOUT</span>
             <strong>Keep text inside preview safe area before printing</strong>
+          </div>
+        </div>
+      </section>
+
+      <section v-if="activeTab === 'appearance'" class="panel queue-panel wide-panel">
+        <div class="panel-head">
+          <div>
+            <h1>Appearance</h1>
+            <span>THEMES / CUSTOM APPLICATION COLOURS</span>
+          </div>
+          <button class="primary" type="button" @click="saveCustomTheme">APPLY CUSTOM COLORS</button>
+        </div>
+
+        <div class="theme-grid">
+          <button
+            v-for="theme in colorThemes"
+            :key="theme.id"
+            class="theme-card"
+            :class="{ selected: activeTheme === theme.id }"
+            type="button"
+            @click="selectTheme(theme.id)"
+          >
+            <span>{{ theme.name }}</span>
+            <strong>{{ theme.note }}</strong>
+            <div class="theme-swatches">
+              <i :style="{ background: theme.colors.bg }"></i>
+              <i :style="{ background: theme.colors.surfaceCard }"></i>
+              <i :style="{ background: theme.colors.primary }"></i>
+              <i :style="{ background: theme.colors.success }"></i>
+              <i :style="{ background: theme.colors.error }"></i>
+            </div>
+          </button>
+        </div>
+
+        <div class="profile-panel">
+          <div class="panel-head compact-head">
+            <div>
+              <h1>Custom Colours</h1>
+              <span>WINDOWS-LIKE PERSONALISATION / SAVED IN THIS BROWSER</span>
+            </div>
+          </div>
+
+          <div class="color-grid">
+            <label>Background <input v-model="customTheme.bg" type="color" /></label>
+            <label>Panel <input v-model="customTheme.surfaceCard" type="color" /></label>
+            <label>Input/Button Surface <input v-model="customTheme.surfaceHigh" type="color" /></label>
+            <label>Main Text <input v-model="customTheme.text" type="color" /></label>
+            <label>Muted Text <input v-model="customTheme.muted" type="color" /></label>
+            <label>Lines/Borders <input v-model="customTheme.line" type="color" /></label>
+            <label>Accent <input v-model="customTheme.primary" type="color" /></label>
+            <label>Primary Button <input v-model="customTheme.primaryDark" type="color" /></label>
+            <label>Online/Success <input v-model="customTheme.success" type="color" /></label>
+            <label>Offline/Error <input v-model="customTheme.error" type="color" /></label>
+            <label>Warning <input v-model="customTheme.warn" type="color" /></label>
           </div>
         </div>
       </section>
