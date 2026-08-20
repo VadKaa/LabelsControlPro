@@ -1,7 +1,7 @@
 # LabelsControlPro
 Labels design and print solution for Brother and Zebra printers. 
 
-   This is a private project owned by Vadim K.
+   This is a private project owned by Vad
 
    By contributing to this repository, collaborators agree that all code, designs, documentation, and other
  contributions submitted to this project are contributed for use in this project and may be used, modified, and
