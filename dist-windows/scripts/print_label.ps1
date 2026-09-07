@@ -1,0 +1,701 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$PayloadPath,
+
+    [Parameter(Mandatory = $false)]
+    [string]$PrinterName = "",
+
+    [Parameter(Mandatory = $false)]
+    [double]$LabelWidthMm = 62,
+
+    [Parameter(Mandatory = $false)]
+    [double]$LabelLengthMm = 60
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Get-Code128BPatterns {
+    param([string]$Text)
+    $patterns = @("212222","222122","222221","121223","121322","131222","122213","122312","132212","221213","221312","231212","112232","122132","122231","113222","123122","123221","223211","221132","221231","213212","223112","312131","311222","321122","321221","312212","322112","322211","212123","212321","232121","111323","131123","131321","112313","132113","132311","211313","231113","231311","112133","112331","132131","113123","113321","133121","313121","211331","231131","213113","213311","213131","311123","311321","331121","312113","312311","332111","314111","221411","431111","111224","111422","121124","121421","141122","141221","112214","112412","122114","122411","142112","142211","241211","221114","413111","241112","134111","111242","121142","121241","114212","124112","124211","411212","421112","421211","212141","214121","412121","111143","111341","131141","114113","114311","411113","411311","113141","114131","311141","411131","211412","211214","211232","2331112")
+    $values = New-Object System.Collections.Generic.List[int]
+    $values.Add(104)
+    foreach ($ch in $Text.ToCharArray()) {
+        $code = [int][char]$ch
+        if ($code -lt 32 -or $code -gt 126) { $code = 32 }
+        $values.Add($code - 32)
+    }
+    $checksum = 104
+    for ($i = 1; $i -lt $values.Count; $i++) { $checksum += $values[$i] * $i }
+    $values.Add($checksum % 103)
+    $values.Add(106)
+    $result = New-Object System.Collections.Generic.List[string]
+    foreach ($value in $values) { $result.Add($patterns[$value]) }
+    return $result
+}
+
+function Draw-Code128B {
+    param($Graphics, [string]$Text, [int]$X, [int]$Y, [int]$Width, [int]$Height, $Brush)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return }
+    $patterns = Get-Code128BPatterns -Text $Text
+    $modules = 0
+    foreach ($pattern in $patterns) {
+        foreach ($digit in $pattern.ToCharArray()) { $modules += [int]::Parse($digit.ToString()) }
+    }
+    $moduleWidth = [Math]::Max(1, [Math]::Floor($Width / $modules))
+    $usedWidth = $modules * $moduleWidth
+    $left = $X + [Math]::Max(0, [Math]::Floor(($Width - $usedWidth) / 2))
+    foreach ($pattern in $patterns) {
+        $drawBar = $true
+        foreach ($digit in $pattern.ToCharArray()) {
+            $w = [int]::Parse($digit.ToString()) * $moduleWidth
+            if ($drawBar) { $Graphics.FillRectangle($Brush, $left, $Y, $w, $Height) }
+            $left += $w
+            $drawBar = -not $drawBar
+        }
+    }
+}
+
+function Get-LayoutOffset {
+    param($Payload, [string]$Field)
+    $result = [ordered]@{ x = 0; y = 0; scale = 1.0 }
+    $layoutProp = $Payload.PSObject.Properties['layout_offsets']
+    if ($null -eq $layoutProp) { return $result }
+    $fieldProp = $layoutProp.Value.PSObject.Properties[$Field]
+    if ($null -eq $fieldProp) { return $result }
+    $fieldValue = $fieldProp.Value
+    if ($fieldValue.PSObject.Properties['x']) { $result.x = [int]$fieldValue.x }
+    if ($fieldValue.PSObject.Properties['y']) { $result.y = [int]$fieldValue.y }
+    if ($fieldValue.PSObject.Properties['scale']) { $result.scale = [double]$fieldValue.scale }
+    if ($result.scale -lt 0.65) { $result.scale = 0.65 }
+    if ($result.scale -gt 1.5) { $result.scale = 1.5 }
+    return ,([pscustomobject]$result)
+}
+
+function New-ScaledFont {
+    param($Font, [double]$Scale)
+    return New-Object System.Drawing.Font($Font.FontFamily, [float]($Font.Size * $Scale), $Font.Style)
+}
+
+function Test-DisplayField {
+    param($Payload, [string]$Field)
+    $displayProp = $Payload.PSObject.Properties['display_options']
+    if ($null -eq $displayProp) { return $true }
+    $fieldProp = $displayProp.Value.PSObject.Properties[$Field]
+    if ($null -eq $fieldProp) { return $true }
+    return [bool]$fieldProp.Value
+}
+
+function Get-DetailsText {
+    param($Payload, [string]$Quantity, [string]$ItemType, [string]$Weight)
+    $parts = @()
+    if (Test-DisplayField -Payload $Payload -Field "quantity") { $parts += "QTY $Quantity" }
+    if (Test-DisplayField -Payload $Payload -Field "item_type") { $parts += "TYPE $ItemType" }
+    if (Test-DisplayField -Payload $Payload -Field "weight") { $parts += "WT $Weight" }
+    return ($parts -join "  |  ")
+}
+
+function Get-FieldFont {
+    param($Payload, [string]$Field, [string]$DefaultFamily, [float]$DefaultSize, $Style)
+    $allowedFamilies = @("Arial", "Helvetica", "Times New Roman", "sans-serif", "serif", "monospace", "Consolas", "Courier New", "Verdana", "Tahoma", "Trebuchet MS", "Georgia")
+    $family = $DefaultFamily
+    $size = $DefaultSize
+    $previewDefaultSize = switch ($Field) {
+        "product_number" { 27.0 }
+        "product_name" { 14.0 }
+        "barcode" { 8.0 }
+        "details" { 9.0 }
+        "notes" { 9.0 }
+        default { 9.0 }
+    }
+    $bold = (($Style -band [System.Drawing.FontStyle]::Bold) -eq [System.Drawing.FontStyle]::Bold)
+    $italic = (($Style -band [System.Drawing.FontStyle]::Italic) -eq [System.Drawing.FontStyle]::Italic)
+    $fontProp = $Payload.PSObject.Properties['font_settings']
+    if ($null -ne $fontProp) {
+        $fieldProp = $fontProp.Value.PSObject.Properties[$Field]
+        if ($null -ne $fieldProp) {
+            if ($fieldProp.Value.PSObject.Properties['family'] -and $fieldProp.Value.family) { $family = $fieldProp.Value.family.ToString() }
+            if ($fieldProp.Value.PSObject.Properties['size'] -and $fieldProp.Value.size) { $size = [float]($DefaultSize * ([float]$fieldProp.Value.size / $previewDefaultSize)) }
+            if ($fieldProp.Value.PSObject.Properties['bold']) { $bold = [bool]$fieldProp.Value.bold }
+            if ($fieldProp.Value.PSObject.Properties['italic']) { $italic = [bool]$fieldProp.Value.italic }
+        }
+    }
+    if ($allowedFamilies -notcontains $family) { $family = $DefaultFamily }
+    if ($family -eq "sans-serif") { $family = "Arial" }
+    if ($family -eq "serif") { $family = "Times New Roman" }
+    if ($family -eq "monospace") { $family = "Consolas" }
+    if ($size -lt 5) { $size = 5 }
+    if ($size -gt 18) { $size = 18 }
+    $fontStyle = [System.Drawing.FontStyle]::Regular
+    if ($bold) { $fontStyle = $fontStyle -bor [System.Drawing.FontStyle]::Bold }
+    if ($italic) { $fontStyle = $fontStyle -bor [System.Drawing.FontStyle]::Italic }
+    return New-Object System.Drawing.Font($family, $size, $fontStyle)
+}
+
+function Set-BrotherQlPrintPreferences {
+    param([string]$PrinterName, [double]$LabelWidthMm, [double]$LabelLengthMm)
+    if ([string]::IsNullOrWhiteSpace($PrinterName)) { return $false }
+    try {
+        $config = Get-PrintConfiguration -PrinterName $PrinterName -ErrorAction Stop
+        if (-not $config.PrintTicketXML) { return $false }
+        [xml]$ticket = $config.PrintTicketXML
+        $nsmgr = New-Object System.Xml.XmlNamespaceManager($ticket.NameTable)
+        $nsmgr.AddNamespace("psf", "http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework")
+        $nsmgr.AddNamespace("psk", "http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords")
+        $brotherPrefix = "ns0001"
+        foreach ($attr in $ticket.DocumentElement.Attributes) {
+            if ($attr.Name -like "xmlns:*" -and $attr.Value -like "http://schemas.brother.info/*") {
+                $brotherPrefix = $attr.Name.Substring(6)
+                $nsmgr.AddNamespace($brotherPrefix, $attr.Value)
+                break
+            }
+        }
+
+        $widthMicrons = [int][Math]::Round($LabelWidthMm * 1000)
+        $heightMicrons = [int][Math]::Round($LabelLengthMm * 1000)
+        $mediaOptionName = switch ([int][Math]::Round($LabelWidthMm)) {
+            38 { "$brotherPrefix`:CustomMediaSize304" }
+            50 { "$brotherPrefix`:CustomMediaSize294" }
+            54 { "$brotherPrefix`:CustomMediaSize293" }
+            62 { "$brotherPrefix`:CustomMediaSize291" }
+            default { "$brotherPrefix`:CustomMediaSize291" }
+        }
+
+        $mediaFeature = $ticket.SelectSingleNode("//psf:Feature[@name='psk:PageMediaSize']", $nsmgr)
+        if ($null -eq $mediaFeature) { return $false }
+        $option = $mediaFeature.SelectSingleNode("psf:Option", $nsmgr)
+        if ($null -eq $option) {
+            $option = $ticket.CreateElement("psf", "Option", $nsmgr.LookupNamespace("psf"))
+            $mediaFeature.AppendChild($option) | Out-Null
+        }
+        $option.SetAttribute("name", $mediaOptionName)
+
+        foreach ($propName in @("psk:MediaSizeWidth", "psk:MediaSizeHeight", "$brotherPrefix`:MediaSizeHeightOffset")) {
+            $prop = $option.SelectSingleNode("psf:ScoredProperty[@name='$propName']", $nsmgr)
+            if ($null -eq $prop) {
+                $prop = $ticket.CreateElement("psf", "ScoredProperty", $nsmgr.LookupNamespace("psf"))
+                $prop.SetAttribute("name", $propName)
+                $option.AppendChild($prop) | Out-Null
+            }
+            $value = $prop.SelectSingleNode("psf:Value", $nsmgr)
+            if ($null -eq $value) {
+                $value = $ticket.CreateElement("psf", "Value", $nsmgr.LookupNamespace("psf"))
+                $value.SetAttribute("type", "http://www.w3.org/2001/XMLSchema-instance", "xsd:integer")
+                $prop.AppendChild($value) | Out-Null
+            }
+            if ($propName -eq "psk:MediaSizeWidth") { $value.InnerText = $widthMicrons.ToString() }
+            elseif ($propName -eq "psk:MediaSizeHeight") { $value.InnerText = $heightMicrons.ToString() }
+            else { $value.InnerText = "3000" }
+        }
+
+        $orientation = $ticket.SelectSingleNode("//psf:Feature[@name='psk:PageOrientation']/psf:Option", $nsmgr)
+        if ($null -ne $orientation) { $orientation.SetAttribute("name", "psk:Landscape") }
+
+        Set-PrintConfiguration -PrinterName $PrinterName -PrintTicketXml $ticket.OuterXml -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-Warning "Could not update Brother printer preferences: $_"
+        return $false
+    }
+}
+
+function Send-RawToPrinter {
+    param([string]$PrinterName, [string]$DocumentName, [string]$Data)
+    $signature = @"
+using System;
+using System.Runtime.InteropServices;
+public class RawPrinterHelper {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+  public class DOCINFOA {
+    [MarshalAs(UnmanagedType.LPStr)] public string pDocName;
+    [MarshalAs(UnmanagedType.LPStr)] public string pOutputFile;
+    [MarshalAs(UnmanagedType.LPStr)] public string pDataType;
+  }
+  [DllImport("winspool.Drv", EntryPoint="OpenPrinterA", SetLastError=true, CharSet=CharSet.Ansi, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+  public static extern bool OpenPrinter(string szPrinter, out IntPtr hPrinter, IntPtr pd);
+  [DllImport("winspool.Drv", EntryPoint="ClosePrinter", SetLastError=true, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+  public static extern bool ClosePrinter(IntPtr hPrinter);
+  [DllImport("winspool.Drv", EntryPoint="StartDocPrinterA", SetLastError=true, CharSet=CharSet.Ansi, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+  public static extern bool StartDocPrinter(IntPtr hPrinter, Int32 level, [In, MarshalAs(UnmanagedType.LPStruct)] DOCINFOA di);
+  [DllImport("winspool.Drv", EntryPoint="EndDocPrinter", SetLastError=true, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+  public static extern bool EndDocPrinter(IntPtr hPrinter);
+  [DllImport("winspool.Drv", EntryPoint="StartPagePrinter", SetLastError=true, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+  public static extern bool StartPagePrinter(IntPtr hPrinter);
+  [DllImport("winspool.Drv", EntryPoint="EndPagePrinter", SetLastError=true, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+  public static extern bool EndPagePrinter(IntPtr hPrinter);
+  [DllImport("winspool.Drv", EntryPoint="WritePrinter", SetLastError=true, ExactSpelling=true, CallingConvention=CallingConvention.StdCall)]
+  public static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, Int32 dwCount, out Int32 dwWritten);
+}
+"@
+    if (-not ([System.Management.Automation.PSTypeName]'RawPrinterHelper').Type) {
+        Add-Type -TypeDefinition $signature
+    }
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($Data)
+    $ptr = [Runtime.InteropServices.Marshal]::AllocCoTaskMem($bytes.Length)
+    [Runtime.InteropServices.Marshal]::Copy($bytes, 0, $ptr, $bytes.Length)
+    $handle = [IntPtr]::Zero
+    try {
+        if (-not [RawPrinterHelper]::OpenPrinter($PrinterName, [ref]$handle, [IntPtr]::Zero)) { throw "Could not open printer: $PrinterName" }
+        $doc = New-Object RawPrinterHelper+DOCINFOA
+        $doc.pDocName = $DocumentName
+        $doc.pDataType = "RAW"
+        if (-not [RawPrinterHelper]::StartDocPrinter($handle, 1, $doc)) { throw "Could not start RAW print document" }
+        [RawPrinterHelper]::StartPagePrinter($handle) | Out-Null
+        $written = 0
+        if (-not [RawPrinterHelper]::WritePrinter($handle, $ptr, $bytes.Length, [ref]$written)) { throw "Could not write RAW print data" }
+        [RawPrinterHelper]::EndPagePrinter($handle) | Out-Null
+        [RawPrinterHelper]::EndDocPrinter($handle) | Out-Null
+    }
+    finally {
+        if ($handle -ne [IntPtr]::Zero) { [RawPrinterHelper]::ClosePrinter($handle) | Out-Null }
+        [Runtime.InteropServices.Marshal]::FreeCoTaskMem($ptr)
+    }
+}
+
+try {
+    Add-Type -AssemblyName System.Drawing
+
+    $payload = Get-Content -LiteralPath $PayloadPath -Raw | ConvertFrom-Json
+
+    $settings = New-Object System.Drawing.Printing.PrinterSettings
+    if ($PrinterName -and $PrinterName.Trim().Length -gt 0) {
+        $settings.PrinterName = $PrinterName
+    }
+
+    if (-not $settings.IsValid) {
+        throw "Printer is not valid or not installed: $PrinterName"
+    }
+
+    $printerProfile = if ($payload.printer_profile) { $payload.printer_profile.ToString() } else { "brother_ql_windows" }
+    $printOrientation = if ($payload.PSObject.Properties['print_orientation'] -and $payload.print_orientation) { $payload.print_orientation.ToString().ToLowerInvariant() } else { "horizontal" }
+    if ($printOrientation -ne "vertical") { $printOrientation = "horizontal" }
+
+    if ($printerProfile -eq "zebra_zpl") {
+        $dpi = if ($payload.PSObject.Properties['zpl_dpi'] -and $payload.zpl_dpi) { [int]$payload.zpl_dpi } else { 203 }
+        if ($dpi -ne 300) { $dpi = 203 }
+        $dotsPerMm = $dpi / 25.4
+        $labelWidthDots = [int][Math]::Round($LabelWidthMm * $dotsPerMm)
+        $labelLengthDots = [int][Math]::Round($LabelLengthMm * $dotsPerMm)
+        $productName = if ($payload.product_name) { $payload.product_name.ToString() } else { "Product" }
+        $productNumber = if ($payload.product_number) { $payload.product_number.ToString() } else { "" }
+        $quantity = if ($payload.quantity) { $payload.quantity.ToString() } else { "" }
+        $itemType = if ($payload.item_type) { $payload.item_type.ToString() } else { "" }
+        $weight = if ($payload.weight) { $payload.weight.ToString() } else { "" }
+        $barcode = if ($payload.barcode) { $payload.barcode.ToString() } else { $productNumber }
+        $notes = if ($payload.notes) { $payload.notes.ToString() } else { "" }
+        $barcodeHeightPct = if ($payload.PSObject.Properties['barcode_height_pct'] -and $payload.barcode_height_pct) { [int]$payload.barcode_height_pct } else { 42 }
+        if ($barcodeHeightPct -lt 20) { $barcodeHeightPct = 20 }
+        if ($barcodeHeightPct -gt 80) { $barcodeHeightPct = 80 }
+        $barcodeHeight = [int][Math]::Round($labelLengthDots * ($barcodeHeightPct / 100.0))
+        if ($barcodeHeight -lt 70) { $barcodeHeight = 70 }
+        if ($barcodeHeight -gt 220) { $barcodeHeight = 220 }
+        $safeBarcode = ($barcode -replace '[\^~]', '')
+        $zplOrient = if ($printOrientation -eq "vertical") { "R" } else { "N" }
+        $zpl = "^XA`n"
+        $zpl += "^CI28`n^PW$labelWidthDots`n^LL$labelLengthDots`n^LH0,0`n"
+        if (Test-DisplayField -Payload $payload -Field "product_number") { $zpl += "^FO20,18^A0$zplOrient,30,30^FD$productNumber^FS`n" }
+        if (Test-DisplayField -Payload $payload -Field "product_name") { $zpl += "^FO20,52^A0$zplOrient,24,24^FB$($labelWidthDots - 40),2,0,L,0^FD$productName^FS`n" }
+        if (Test-DisplayField -Payload $payload -Field "barcode") { $zpl += "^FO20,105^BY2,2,$barcodeHeight^BC$zplOrient,$barcodeHeight,Y,N,N^FD$safeBarcode^FS`n" }
+        if ($payload.PSObject.Properties['show_qr'] -and $payload.show_qr) {
+            $offQr = Get-LayoutOffset -Payload $payload -Field "qr_code"
+            $qrX = [int](($labelWidthDots - 145) + $offQr.x)
+            $qrY = [int](20 + $offQr.y)
+            $zpl += "^FO$qrX,$qrY^BQN,2,4^FDLA,$safeBarcode^FS`n"
+        }
+        $details = @()
+        if (Test-DisplayField -Payload $payload -Field "quantity") { $details += "QTY $quantity" }
+        if (Test-DisplayField -Payload $payload -Field "item_type") { $details += "TYPE $itemType" }
+        if (Test-DisplayField -Payload $payload -Field "weight") { $details += "WT $weight" }
+        if ($details.Count -gt 0) { $zpl += "^FO20,$($barcodeHeight + 185)^A0$zplOrient,20,20^FD$($details -join '   ')^FS`n" }
+        if ((Test-DisplayField -Payload $payload -Field "notes") -and $notes.Length -gt 0) { $zpl += "^FO20,$($barcodeHeight + 212)^A0$zplOrient,18,18^FB$($labelWidthDots - 40),2,0,L,0^FD$notes^FS`n" }
+        $zpl += "^XZ`n"
+        Send-RawToPrinter -PrinterName $settings.PrinterName -DocumentName "Product label ZPL" -Data $zpl
+        [ordered]@{ status = "printed"; printer = $settings.PrinterName; printer_profile = $printerProfile; zpl_dpi = $dpi; print_orientation = $printOrientation; label_width_mm = $LabelWidthMm; label_length_mm = $LabelLengthMm } | ConvertTo-Json -Depth 10
+        exit 0
+    }
+
+    $doc = New-Object System.Drawing.Printing.PrintDocument
+    $doc.PrinterSettings = $settings
+    $doc.DocumentName = "Product label"
+
+    # Brother DK-2205 is 62mm continuous tape. PrintDocument uses hundredths of an inch.
+    # Paper width is the roll width; paper height is the cut length. Landscape makes text run along the label length.
+    $labelWidthHi = [int][Math]::Round(($LabelWidthMm / 25.4) * 100)
+    $labelLengthHi = [int][Math]::Round(($LabelLengthMm / 25.4) * 100)
+    $paperSize = $null
+    $printerProfile = if ($payload.PSObject.Properties['printer_profile'] -and $payload.printer_profile) { $payload.printer_profile.ToString() } else { "brother_ql_windows" }
+    $driverMediaName = if ($payload.PSObject.Properties['driver_media_name'] -and $payload.driver_media_name) { $payload.driver_media_name.ToString() } else { "" }
+    if ([string]::IsNullOrWhiteSpace($driverMediaName) -and $printerProfile -eq "brother_ql_windows") { $driverMediaName = "${LabelWidthMm}mm" }
+
+    if ($printerProfile -eq "zebra_zpl") {
+        throw "Zebra ZPL profile is planned but not active yet. Select Brother QL or Generic Windows."
+    }
+
+    # Do not change global Brother Printing Preferences here. Changing the saved PrintTicket can
+    # make the driver report "wrong tape size" until preferences are manually fixed. Instead,
+    # choose the correct per-job PaperSize below.
+    $preferencesUpdated = $false
+
+    # Prefer an exact per-job media size first.
+    # Brother QL drivers validate the installed roll against the selected PaperSize RawKind.
+    # For Brother continuous tape, use the driver's own "62mm" paper size object exactly;
+    # do not create a custom "62mm x 60mm" PaperSize or the driver can report a roll mismatch.
+    foreach ($size in $settings.PaperSizes) {
+        $widthMatches = [Math]::Abs($size.Width - $labelWidthHi) -le 2
+        $lengthMatches = [Math]::Abs($size.Height - $labelLengthHi) -le 4
+        if ($widthMatches -and $lengthMatches) {
+            $paperSize = $size
+            break
+        }
+    }
+
+    if (($null -eq $paperSize) -and -not [string]::IsNullOrWhiteSpace($driverMediaName)) {
+        foreach ($size in $settings.PaperSizes) {
+            if ($size.PaperName -eq $driverMediaName) {
+                if ($driverMediaName -match '^\d+mm$') {
+                    $paperSize = New-Object System.Drawing.Printing.PaperSize($size.PaperName, $labelWidthHi, $labelLengthHi)
+                    try { $paperSize.RawKind = $size.RawKind } catch { }
+                } else {
+                    $paperSize = $size
+                }
+                break
+            }
+        }
+    }
+
+    if (($null -eq $paperSize) -and ($printerProfile -eq "brother_ql_windows")) {
+        foreach ($size in $settings.PaperSizes) {
+            if ($size.PaperName -eq "User Defined Size") {
+                $paperSize = New-Object System.Drawing.Printing.PaperSize($size.PaperName, $labelWidthHi, $labelLengthHi)
+                try { $paperSize.RawKind = $size.RawKind } catch { }
+                break
+            }
+        }
+    }
+
+    if ($null -eq $paperSize) {
+        if ($printerProfile -eq "brother_ql_windows") {
+            throw "Brother media '$driverMediaName' was not found in the Windows driver. Select the exact installed roll media, e.g. 62mm, not 62mm x 60mm."
+        }
+        $paperName = "${LabelWidthMm}mm x ${LabelLengthMm}mm"
+        $paperSize = New-Object System.Drawing.Printing.PaperSize($paperName, $labelWidthHi, $labelLengthHi)
+    }
+
+    $doc.DefaultPageSettings.PaperSize = $paperSize
+    # Brother QL continuous media is most reliable when the Windows driver stays in landscape.
+    # Vertical is handled by layout/field coordinates, not by flipping the driver page orientation.
+    if ($printerProfile -eq "brother_ql_windows") {
+        $doc.DefaultPageSettings.Landscape = $true
+    } else {
+        $doc.DefaultPageSettings.Landscape = ($printOrientation -eq "horizontal")
+    }
+    $doc.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)
+
+    if ($payload.PSObject.Properties['preview_image_data_url'] -and $payload.preview_image_data_url) {
+        $dataUrl = $payload.preview_image_data_url.ToString()
+        $commaIndex = $dataUrl.IndexOf(',')
+        if ($commaIndex -gt 0) {
+            $base64 = $dataUrl.Substring($commaIndex + 1)
+            $bytes = [Convert]::FromBase64String($base64)
+            $stream = New-Object System.IO.MemoryStream(,$bytes)
+            $previewImage = [System.Drawing.Image]::FromStream($stream)
+            $imageHandler = [System.Drawing.Printing.PrintPageEventHandler] {
+                param($sender, $e)
+                $g = $e.Graphics
+                $g.Clear([System.Drawing.Color]::White)
+                $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+                $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+                if ($printerProfile -eq "brother_ql_windows") {
+                    # Draw the captured preview into the exact requested label design size.
+                    # Do not shrink, center, or shift for printable margins here: if content is outside
+                    # the real printer area, let the printer clip it naturally instead of moving layout.
+                    $targetWidth = $labelLengthHi
+                    $targetHeight = $labelWidthHi
+                    $targetX = 0
+                    $targetY = 0
+                } else {
+                    $targetWidth = $e.PageBounds.Width
+                    $targetHeight = $e.PageBounds.Height
+                    $targetX = 0
+                    $targetY = 0
+                }
+                $dest = New-Object System.Drawing.Rectangle($targetX, $targetY, $targetWidth, $targetHeight)
+                $g.DrawImage($previewImage, $dest)
+                $e.HasMorePages = $false
+            }
+            $doc.add_PrintPage($imageHandler)
+            $doc.Print()
+            $previewImage.Dispose()
+            $stream.Dispose()
+            [ordered]@{
+                status = "printed"
+                printer = $doc.PrinterSettings.PrinterName
+                render_mode = "preview_image"
+                label_width_mm = $LabelWidthMm
+                label_length_mm = $LabelLengthMm
+                paper_size = $doc.DefaultPageSettings.PaperSize.PaperName
+                paper_raw_kind = $doc.DefaultPageSettings.PaperSize.RawKind
+                driver_media_name = $driverMediaName
+                printer_profile = $printerProfile
+                print_orientation = $printOrientation
+                preferences_updated = $preferencesUpdated
+            } | ConvertTo-Json -Depth 10
+            exit 0
+        }
+    }
+
+    $fontTitle = Get-FieldFont -Payload $payload -Field "product_name" -DefaultFamily "Arial" -DefaultSize 11 -Style ([System.Drawing.FontStyle]::Bold)
+    $fontSku = Get-FieldFont -Payload $payload -Field "product_number" -DefaultFamily "Consolas" -DefaultSize 10 -Style ([System.Drawing.FontStyle]::Bold)
+    $fontText = Get-FieldFont -Payload $payload -Field "details" -DefaultFamily "Arial" -DefaultSize 7 -Style ([System.Drawing.FontStyle]::Regular)
+    $fontSmall = Get-FieldFont -Payload $payload -Field "details" -DefaultFamily "Arial" -DefaultSize 6 -Style ([System.Drawing.FontStyle]::Regular)
+    $fontBarcode = Get-FieldFont -Payload $payload -Field "barcode" -DefaultFamily "Consolas" -DefaultSize 7 -Style ([System.Drawing.FontStyle]::Bold)
+    $black = [System.Drawing.Brushes]::Black
+
+    $handler = [System.Drawing.Printing.PrintPageEventHandler] {
+        param($sender, $e)
+
+        $g = $e.Graphics
+        $g.Clear([System.Drawing.Color]::White)
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+
+        $x = 10
+        $y = 8
+        $line = 16
+        $pageWidth = $e.PageBounds.Width
+        $pageHeight = $e.PageBounds.Height
+        # Draw against the requested label design size, not the driver's larger continuous-media page.
+        # This keeps preview and print from reflowing when Brother reports a bigger printable area.
+        $designWidth = if ($printerProfile -eq "brother_ql_windows") { $labelLengthHi } else { $pageWidth }
+        $designHeight = if ($printerProfile -eq "brother_ql_windows") { $labelWidthHi } else { $pageHeight }
+        $contentWidth = [Math]::Max(100, $designWidth - 20)
+        # Layout offsets are stored in physical millimeters by the live preview.
+        # PrintDocument uses hundredths of an inch, so use the same physical coordinates here.
+        $offsetScaleX = 100.0 / 25.4
+        $offsetScaleY = 100.0 / 25.4
+        $clipFormat = New-Object System.Drawing.StringFormat
+        $clipFormat.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+        $clipFormat.Trimming = [System.Drawing.StringTrimming]::None
+
+        $productName = if ($payload.product_name) { $payload.product_name.ToString() } else { "Product" }
+        $productNumber = if ($payload.product_number) { $payload.product_number.ToString() } else { "" }
+        $quantity = if ($payload.quantity) { $payload.quantity.ToString() } else { "" }
+        $itemType = if ($payload.item_type) { $payload.item_type.ToString() } else { "" }
+        $weight = if ($payload.weight) { $payload.weight.ToString() } else { "" }
+        $barcode = if ($payload.barcode) { $payload.barcode.ToString() } else { "" }
+        $notes = if ($payload.notes) { $payload.notes.ToString() } else { "" }
+        $offProductNumber = Get-LayoutOffset -Payload $payload -Field "product_number"
+        $offProductName = Get-LayoutOffset -Payload $payload -Field "product_name"
+        $offBarcode = Get-LayoutOffset -Payload $payload -Field "barcode"
+        $offDetails = Get-LayoutOffset -Payload $payload -Field "details"
+        $offNotes = Get-LayoutOffset -Payload $payload -Field "notes"
+        $layoutPreset = if ($payload.PSObject.Properties['layout_preset'] -and $payload.layout_preset) { $payload.layout_preset.ToString() } else { "compact_right" }
+        $barcodeWidthPct = if ($payload.PSObject.Properties['barcode_width_pct'] -and $payload.barcode_width_pct) { [int]$payload.barcode_width_pct } else { 42 }
+        if ($barcodeWidthPct -lt 30) { $barcodeWidthPct = 30 }
+        if ($barcodeWidthPct -gt 55) { $barcodeWidthPct = 55 }
+        $barcodeHeightPct = if ($payload.PSObject.Properties['barcode_height_pct'] -and $payload.barcode_height_pct) { [int]$payload.barcode_height_pct } else { 42 }
+        if ($barcodeHeightPct -lt 20) { $barcodeHeightPct = 20 }
+        if ($barcodeHeightPct -gt 80) { $barcodeHeightPct = 80 }
+        $barcodeHeightPx = [int][Math]::Round(18 + ($barcodeHeightPct * 0.65))
+
+        if ($layoutPreset -eq "stacked") {
+            $opnX = [int]([double]$offProductNumber.x * $offsetScaleX); $opnY = [int]([double]$offProductNumber.y * $offsetScaleY); $opnS = [double]$offProductNumber.scale
+            $opdX = [int]([double]$offProductName.x * $offsetScaleX); $opdY = [int]([double]$offProductName.y * $offsetScaleY); $opdS = [double]$offProductName.scale
+            $obcX = [int]([double]$offBarcode.x * $offsetScaleX); $obcY = [int]([double]$offBarcode.y * $offsetScaleY); $obcS = [double]$offBarcode.scale
+            $odtX = [int]([double]$offDetails.x * $offsetScaleX); $odtY = [int]([double]$offDetails.y * $offsetScaleY); $odtS = [double]$offDetails.scale
+            $ontX = [int]([double]$offNotes.x * $offsetScaleX); $ontY = [int]([double]$offNotes.y * $offsetScaleY); $ontS = [double]$offNotes.scale
+            $skuFont = New-ScaledFont -Font $fontSku -Scale $opnS
+            $titleFont = New-ScaledFont -Font $fontTitle -Scale $opdS
+            $detailsFont = New-ScaledFont -Font $fontSmall -Scale $odtS
+            $notesFont = New-ScaledFont -Font $fontSmall -Scale $ontS
+            $barcodeFontScaled = New-ScaledFont -Font $fontBarcode -Scale $obcS
+
+            $topY = $y
+            if (Test-DisplayField -Payload $payload -Field "product_number") { $g.DrawString($productNumber, $skuFont, $black, [int]($x + $opnX), [int]($topY + $opnY)) }
+            $titleYStack = [int]($topY + 15 + $opdY)
+            $titleRectStack = New-Object System.Drawing.RectangleF([int]($x + $opdX), $titleYStack, $contentWidth, 24)
+            if (Test-DisplayField -Payload $payload -Field "product_name") { $g.DrawString($productName, $titleFont, $black, $titleRectStack) }
+
+            # Match the browser stacked preview order: title block, details/notes, then barcode.
+            # This avoids barcode/title overlap when custom fonts or drag offsets are used.
+            $y = $topY + 46
+            $detailsText = Get-DetailsText -Payload $payload -Quantity $quantity -ItemType $itemType -Weight $weight
+            if ($detailsText.Length -gt 0) {
+                $detailsRectStack = New-Object System.Drawing.RectangleF([int]($x + $odtX), [int]($y + $odtY), $contentWidth, 14)
+                $g.DrawString($detailsText, $detailsFont, $black, $detailsRectStack)
+                $y += 16
+            }
+            if ((Test-DisplayField -Payload $payload -Field "notes") -and $notes.Length -gt 0) {
+                $rectStack = New-Object System.Drawing.RectangleF([int]($x + $ontX), [int]($y + $ontY), $contentWidth, 18)
+                $g.DrawString("Notes: $notes", $notesFont, $black, $rectStack)
+                $y += 18
+            }
+
+            $stackBarcodeWidth = [Math]::Min($contentWidth, [Math]::Max(90, [int]($contentWidth * (($barcodeWidthPct + 45) / 100))))
+            $stackBarcodeWidth = [int]($stackBarcodeWidth * $obcS)
+            $stackBarcodeX = [int]($x + [Math]::Floor(($contentWidth - $stackBarcodeWidth) / 2) + $obcX)
+            $stackBarcodeY = [int]($y + 4 + $obcY)
+            $stackBarcodeHeight = [int]($barcodeHeightPx * $obcS)
+            $barcodeTextYStack = [int]($stackBarcodeY + $stackBarcodeHeight + 2)
+            if (Test-DisplayField -Payload $payload -Field "barcode") {
+                Draw-Code128B -Graphics $g -Text $barcode -X $stackBarcodeX -Y $stackBarcodeY -Width $stackBarcodeWidth -Height $stackBarcodeHeight -Brush $black
+                $barcodeTextRectStack = New-Object System.Drawing.RectangleF($stackBarcodeX, $barcodeTextYStack, $stackBarcodeWidth, 10)
+                $barcodeFormatStack = New-Object System.Drawing.StringFormat
+                $barcodeFormatStack.Alignment = [System.Drawing.StringAlignment]::Center
+                $g.DrawString($barcode, $barcodeFontScaled, $black, $barcodeTextRectStack, $barcodeFormatStack)
+            }
+            $e.HasMorePages = $false
+            return
+        }
+
+        if ($layoutPreset -eq "barcode_bottom") {
+            $g.DrawString($productNumber, $fontSku, $black, $x, $y)
+            $titleYBottom = $y + 15
+            $titleRectBottom = New-Object System.Drawing.RectangleF($x, $titleYBottom, $contentWidth, 22)
+            $g.DrawString($productName, $fontTitle, $black, $titleRectBottom)
+            $y += 38
+            $colWBottom = [Math]::Floor($contentWidth / 3)
+            $g.DrawString("QTY $quantity", $fontSmall, $black, $x, $y)
+            $g.DrawString("TYPE $itemType", $fontSmall, $black, $x + $colWBottom, $y)
+            $g.DrawString("WT $weight", $fontSmall, $black, $x + ($colWBottom * 2), $y)
+            $y += 12
+            $wideBarcodeWidth = [Math]::Min($contentWidth, [Math]::Max(90, [int]($contentWidth * (($barcodeWidthPct + 45) / 100))))
+            $wideBarcodeX = $x + [Math]::Floor(($contentWidth - $wideBarcodeWidth) / 2)
+            Draw-Code128B -Graphics $g -Text $barcode -X $wideBarcodeX -Y $y -Width $wideBarcodeWidth -Height 34 -Brush $black
+            $barcodeTextYBottom = $y + 36
+            $barcodeTextRectBottom = New-Object System.Drawing.RectangleF($wideBarcodeX, $barcodeTextYBottom, $wideBarcodeWidth, 10)
+            $barcodeFormatBottom = New-Object System.Drawing.StringFormat
+            $barcodeFormatBottom.Alignment = [System.Drawing.StringAlignment]::Center
+            $g.DrawString($barcode, $fontBarcode, $black, $barcodeTextRectBottom, $barcodeFormatBottom)
+            $e.HasMorePages = $false
+            return
+        }
+
+        if ($layoutPreset -eq "minimal") {
+            $skuWidth = $contentWidth
+            $g.DrawString($productNumber, $fontSku, $black, $x, $y)
+            $y += 22
+            $minimalBarcodeWidth = [Math]::Min($skuWidth, [Math]::Max(90, [int]($skuWidth * (($barcodeWidthPct + 45) / 100))))
+            $minimalBarcodeX = $x + [Math]::Floor(($skuWidth - $minimalBarcodeWidth) / 2)
+            Draw-Code128B -Graphics $g -Text $barcode -X $minimalBarcodeX -Y $y -Width $minimalBarcodeWidth -Height 44 -Brush $black
+            $barcodeTextYMinimal = $y + 46
+            $barcodeTextRectMinimal = New-Object System.Drawing.RectangleF($minimalBarcodeX, $barcodeTextYMinimal, $minimalBarcodeWidth, 10)
+            $barcodeFormatMinimal = New-Object System.Drawing.StringFormat
+            $barcodeFormatMinimal.Alignment = [System.Drawing.StringAlignment]::Center
+            $g.DrawString($barcode, $fontBarcode, $black, $barcodeTextRectMinimal, $barcodeFormatMinimal)
+            $e.HasMorePages = $false
+            return
+        }
+
+        $opnX = [int]([double]$offProductNumber.x * $offsetScaleX); $opnY = [int]([double]$offProductNumber.y * $offsetScaleY); $opnS = [double]$offProductNumber.scale
+        $opdX = [int]([double]$offProductName.x * $offsetScaleX); $opdY = [int]([double]$offProductName.y * $offsetScaleY); $opdS = [double]$offProductName.scale
+        $obcX = [int]([double]$offBarcode.x * $offsetScaleX); $obcY = [int]([double]$offBarcode.y * $offsetScaleY); $obcS = [double]$offBarcode.scale
+        $odtX = [int]([double]$offDetails.x * $offsetScaleX); $odtY = [int]([double]$offDetails.y * $offsetScaleY); $odtS = [double]$offDetails.scale
+        $ontX = [int]([double]$offNotes.x * $offsetScaleX); $ontY = [int]([double]$offNotes.y * $offsetScaleY); $ontS = [double]$offNotes.scale
+
+        $skuFont = New-ScaledFont -Font $fontSku -Scale $opnS
+        $titleFont = New-ScaledFont -Font $fontTitle -Scale $opdS
+        $detailsFont = New-ScaledFont -Font $fontSmall -Scale $odtS
+        $notesFont = New-ScaledFont -Font $fontSmall -Scale $ontS
+        $barcodeFontScaled = New-ScaledFont -Font $fontBarcode -Scale $obcS
+
+        # Fixed physical anchors. Do not reflow or shift other fields if text/barcode is too large.
+        # Anything outside its rectangle is clipped/truncated by GDI instead of moving layout.
+        $detailsTop = [int]($designHeight * 0.47)
+        $titleTop = [int]($designHeight * 0.78)
+        $barcodeBaseWidth = [Math]::Min([int]($designWidth * 0.34), [Math]::Max(82, [int]($contentWidth * ($barcodeWidthPct / 100))))
+        $barcodeDrawWidth = [int]($barcodeBaseWidth * $obcS)
+        $barcodeDrawHeight = [int]($barcodeHeightPx * $obcS)
+        $barcodeDrawX = [int]($x + [Math]::Floor(($designWidth - $barcodeDrawWidth) / 2) + $obcX)
+        if ($layoutPreset -eq "barcode_left") { $barcodeDrawX = [int]($x + $obcX) }
+        $barcodeDrawY = [int]($y + $obcY)
+
+        if (Test-DisplayField -Payload $payload -Field "product_number") {
+            $skuRect = New-Object System.Drawing.RectangleF([int]($x + $opnX), [int]($y + $opnY), [int]($designWidth * 0.30), 18)
+            $g.DrawString($productNumber, $skuFont, $black, $skuRect, $clipFormat)
+        }
+        if (Test-DisplayField -Payload $payload -Field "product_name") {
+            $titleRect = New-Object System.Drawing.RectangleF([int]($x + $opdX), [int]($titleTop + $opdY), [int]($designWidth * 0.46), 24)
+            $g.DrawString($productName, $titleFont, $black, $titleRect, $clipFormat)
+        }
+
+        if (Test-DisplayField -Payload $payload -Field "barcode") {
+            Draw-Code128B -Graphics $g -Text $barcode -X $barcodeDrawX -Y $barcodeDrawY -Width $barcodeDrawWidth -Height $barcodeDrawHeight -Brush $black
+            $barcodeTextRect = New-Object System.Drawing.RectangleF($barcodeDrawX, [int]($barcodeDrawY + $barcodeDrawHeight + 2), $barcodeDrawWidth, 12)
+            $barcodeFormat = New-Object System.Drawing.StringFormat
+            $barcodeFormat.Alignment = [System.Drawing.StringAlignment]::Center
+            $barcodeFormat.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+            $g.DrawString($barcode, $barcodeFontScaled, $black, $barcodeTextRect, $barcodeFormat)
+        }
+
+        $detailW = [int]($designWidth * 0.18)
+        if (Test-DisplayField -Payload $payload -Field "item_type") {
+            $itemRect = New-Object System.Drawing.RectangleF([int]($x + $odtX), [int]($detailsTop + $odtY), $detailW, 25)
+            $g.DrawString("ITEM TYPE`n$itemType", $detailsFont, $black, $itemRect)
+        }
+        if (Test-DisplayField -Payload $payload -Field "weight") {
+            $weightRect = New-Object System.Drawing.RectangleF([int]($x + ($designWidth * 0.22) + $odtX), [int]($detailsTop + $odtY), $detailW, 25)
+            $g.DrawString("WEIGHT`n$weight", $detailsFont, $black, $weightRect)
+        }
+        if (Test-DisplayField -Payload $payload -Field "quantity") {
+            $qtyRect = New-Object System.Drawing.RectangleF([int]($x + ($designWidth * 0.40) + $odtX), [int]($detailsTop + $odtY), $detailW, 25)
+            $g.DrawString("QTY`n$quantity", $detailsFont, $black, $qtyRect)
+        }
+        if ((Test-DisplayField -Payload $payload -Field "notes") -and $notes.Length -gt 0) {
+            $notesRect = New-Object System.Drawing.RectangleF([int]($x + ($designWidth * 0.57) + $ontX), [int]($detailsTop + $ontY), [int]($designWidth * 0.22), 30)
+            $g.DrawString("NOTES`n$notes", $notesFont, $black, $notesRect)
+        }
+
+        if ($payload.PSObject.Properties['show_qr'] -and $payload.show_qr) {
+            $offQr = Get-LayoutOffset -Payload $payload -Field "qr_code"
+            $qrSize = 46
+            $cell = 4
+            $qrX = [Math]::Max(2, $pageWidth - $qrSize - 8 + ([double]$offQr.x * $offsetScaleX))
+            $qrY = [Math]::Max(2, $pageHeight - $qrSize - 8 + ([double]$offQr.y * $offsetScaleY))
+            $g.FillRectangle([System.Drawing.Brushes]::White, $qrX, $qrY, $qrSize, $qrSize)
+            $g.DrawRectangle([System.Drawing.Pens]::Black, $qrX, $qrY, $qrSize, $qrSize)
+            $source = "$barcode|$productName"
+            if ([string]::IsNullOrWhiteSpace($source)) { $source = "LABEL" }
+            for ($row = 0; $row -lt 11; $row++) {
+                for ($col = 0; $col -lt 11; $col++) {
+                    $index = ($row * 11) + $col
+                    $code = [int][char]$source[$index % $source.Length]
+                    if ((($code + ($index * 7) + ($row * 13)) % 5) -lt 2) {
+                        $g.FillRectangle($black, $qrX + 2 + ($col * $cell), $qrY + 2 + ($row * $cell), $cell, $cell)
+                    }
+                }
+            }
+        }
+
+        $e.HasMorePages = $false
+    }
+
+    $doc.add_PrintPage($handler)
+    $doc.Print()
+
+    $printerUsed = $doc.PrinterSettings.PrinterName
+    $result = [ordered]@{
+        status = "printed"
+        printer = $printerUsed
+        label_width_mm = $LabelWidthMm
+        label_length_mm = $LabelLengthMm
+        paper_size = $doc.DefaultPageSettings.PaperSize.PaperName
+        paper_raw_kind = $doc.DefaultPageSettings.PaperSize.RawKind
+        driver_media_name = $driverMediaName
+        printer_profile = $printerProfile
+        print_orientation = $printOrientation
+        preferences_updated = $preferencesUpdated
+    }
+    $result | ConvertTo-Json -Depth 10
+    exit 0
+}
+catch {
+    $result = [ordered]@{
+        status = "error"
+        error = $_.Exception.Message
+    }
+    $result | ConvertTo-Json -Depth 10
+    exit 1
+}
